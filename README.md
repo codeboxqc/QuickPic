@@ -7,7 +7,7 @@ NVIDIA CUDA Toolkit: Matching your GPU (e.g., CUDA 12.x). Install to default pat
 cuDNN (optional but recommended for DNN CUDA): Match your CUDA version.
 Git: To clone repositories.
 Python (optional):
-
+ 
 make folfer
 git clone https://github.com/opencv/opencv.git
 git clone https://github.com/opencv/opencv_contrib.git
