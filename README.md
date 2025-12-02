@@ -207,6 +207,18 @@ cmake -G "Visual Studio 17 2022" -A x64 ^
   -DBUILD_TESTS=OFF ^
   ..
 
+or
+
+cmake -S C:\src\opencv -B C:\build\opencv -G "Visual Studio 17 2022" -A x64 `
+  -DBUILD_SHARED_LIBS=ON `
+  -DWITH_CUDA=ON `
+  -DBUILD_opencv_world=ON `
+  -DOPENCV_EXTRA_MODULES_PATH=C:\src\opencv_contrib\modules `
+  -DBUILD_LIST=core,imgproc,imgcodecs,highgui,photo,cudaarithm,cudafilters,cudaimgproc,cudawarping,cudev `
+  -DCMAKE_INSTALL_PREFIX=C:\build\opencv\install
+
+
+
 # Build (takes 30-60 minutes)
 cmake --build . --config Release --parallel 8
 
