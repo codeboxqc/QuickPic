@@ -100,7 +100,7 @@
 
 ### Quick Start (Pre-built Binary)
 
-1. Download the latest release from [Releases](https://github.com/yourusername/quickconvert/releases)
+1. Download the latest release from  https://github.com/codeboxqc/QuickPic/releases/tag/1
 2. Extract `QuickConvert.zip` to your desired location
 3. Run `QuickConvert.exe`
 4. (Optional) Create a desktop shortcut
