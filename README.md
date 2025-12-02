@@ -9,6 +9,7 @@
 ![GPU](https://img.shields.io/badge/GPU-CUDA%20%7C%20OpenCL-orange.svg)
 
 ---
+![Untitled](https://github.com/user-attachments/assets/ba7f99ec-08bc-43a8-97fe-aeb1bcbbbccf)
 
 ## 📋 Table of Contents
 
