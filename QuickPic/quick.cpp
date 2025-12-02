@@ -21,6 +21,7 @@
 #include <thread>
 #include <chrono>
 #include <vector>
+ 
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/core.hpp>
@@ -38,6 +39,9 @@
 
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/highgui.hpp>
+
+
+#define SHCHG_ASSOCCHANGED 0x08000000
  
 
 #pragma comment(lib, "opencv_world4130.lib")
@@ -1214,6 +1218,156 @@ void ProcessFilesAsync(HWND hWnd, const std::vector<std::wstring>& paths)
 
     // === 1. Collect ALL images (supports folders + files) ===
     std::vector<std::wstring> allImages;
+    allImages.reserve(2000);
+
+    for (const auto& p : paths) {
+        auto files = g_converter->getAllImageFiles(p);
+        allImages.insert(allImages.end(), files.begin(), files.end());
+    }
+
+    if (allImages.empty()) {
+        g_isConverting = false;
+        MessageBoxW(hWnd, L"No supported images found!", L"Info", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    // === 2. Prepare output format & folder ===
+    std::wstring formatExt;
+    switch (g_state.format) {
+    case OutputFormat::JPG:  formatExt = L".jpg";  break;
+    case OutputFormat::PNG:  formatExt = L".png";  break;
+    case OutputFormat::WEBP: formatExt = L".webp"; break;
+    case OutputFormat::TIF:  formatExt = L".tif";  break;
+    case OutputFormat::BMP:  formatExt = L".bmp";  break;
+    case OutputFormat::GIF:  formatExt = L".gif";  break;
+    }
+
+    std::wstring outputDir = g_state.outputFolder.empty() ? std::wstring(g_outputFolder) : g_state.outputFolder;
+
+    // === 3. Compression params ===
+    std::vector<int> params;
+    if (g_state.format == OutputFormat::JPG)
+        params = { cv::IMWRITE_JPEG_QUALITY, g_state.quality };
+    else if (g_state.format == OutputFormat::WEBP)
+        params = { cv::IMWRITE_WEBP_QUALITY, g_state.quality };
+    else if (g_state.format == OutputFormat::PNG)
+        params = { cv::IMWRITE_PNG_COMPRESSION, 9 };
+
+    clock_t start = clock();
+
+    // === 4. Background thread with ThreadPool (THE FIXED VERSION) ===
+    std::thread([hWnd, allImages = std::move(allImages), outputDir, formatExt, params, start]() {
+
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+        int threadCount = std::max(8, (int)std::thread::hardware_concurrency());
+        if (g_state.useGpu && g_converter->isGpuAvailable())
+            threadCount = std::max(16, threadCount);
+
+        ThreadPool pool(threadCount);
+
+        // CORRECT ATOMIC COUNTERS
+        std::atomic<int> processed{ 0 };
+        std::atomic<int> succeeded{ 0 };
+        std::atomic<int> failed_count{ 0 };
+        bool usedGpu = false;
+        bool forceCpu = g_state.doDenoise;  // Denoising kills GPU speed anyway
+
+        // Create output folder once
+        CreateDirectoryW(outputDir.c_str(), nullptr);
+
+        // Set total immediately so UI shows "0 / N"
+        g_conversionTotal.store((int)allImages.size());
+        PostMessage(hWnd, WM_USER + 1, 0, 0);
+
+        for (const auto& inputPath : allImages) {
+            pool.enqueue([&, inputPath]() {
+                // Update status bar with filename
+                std::wstring filename = inputPath.substr(inputPath.find_last_of(L"\\") + 1);
+                {
+                    std::lock_guard<std::mutex> l(g_statusMutex);
+                    g_conversionStatus = L"Blazing: " + filename;
+                }
+
+                std::wstring outputPath = g_converter->getOutputPath(inputPath, outputDir, formatExt);
+
+                // Wide → UTF-8
+                auto toUtf8 = [](const std::wstring& s) -> std::string {
+                    int len = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                    std::string out(len - 1, 0);
+                    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, out.data(), len, nullptr, nullptr);
+                    return out;
+                    };
+
+                std::string inA = toUtf8(inputPath);
+                std::string outA = toUtf8(outputPath);
+
+                bool success = false;
+
+                if (g_state.useGpu && g_converter->isGpuAvailable() && !forceCpu) {
+                    usedGpu = true;
+                    if (g_converter->gpu_device.isCuda())
+                        success = g_converter->convertImageCUDA(inA, outA, params, g_state);
+                    else
+                        success = g_converter->convertImageOCL(inA, outA, params, g_state);
+                }
+                else {
+                    success = g_converter->convertImageCPU(inA, outA, params, g_state);
+                }
+
+                if (success) succeeded++;
+                else failed_count++;
+
+                // CORRECT PROGRESS UPDATE
+                int current = ++processed;
+                g_conversionProgress.store(current);
+
+                PostMessage(hWnd, WM_USER + 1, 0, 0);
+                });
+        }
+
+        pool.wait();
+
+        double sec = (double)(clock() - start) / CLOCKS_PER_SEC;
+
+        g_resultImageCount = succeeded.load();
+        g_resultFailedCount = failed_count.load();
+        g_resultDuration = sec;
+        g_resultGpuUsed = usedGpu;
+        g_showResult = true;
+        g_resultTime = clock();
+        g_isConverting = false;
+        PostMessage(hWnd, WM_USER + 1, 0, 0);
+
+        // Final update
+        PostMessage(hWnd, WM_USER + 1, 0, 0);
+
+        // Optional: force Explorer refresh
+       SHChangeNotify(SHCHG_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+
+        }).detach();
+}
+
+
+/*
+void ProcessFilesAsync2(HWND hWnd, const std::vector<std::wstring>& paths)
+{
+    if (!g_converter || paths.empty()) return;
+
+    if (g_isConverting.exchange(true)) {
+        MessageBoxW(hWnd, L"Conversion already in progress!", L"Busy", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    g_conversionProgress = 0;
+    g_conversionTotal = 0;
+    g_resultImageCount = 0;
+    g_resultFailedCount = 0;
+    g_resultGpuUsed = false;
+    g_showResult = false;
+
+    // === 1. Collect ALL images (supports folders + files) ===
+    std::vector<std::wstring> allImages;
     allImages.reserve(1000);
 
     for (const auto& p : paths) {
@@ -1259,7 +1413,7 @@ void ProcessFilesAsync(HWND hWnd, const std::vector<std::wstring>& paths)
         // ULTRA SPEED MODE ENGAGED
         // ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
         //SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        // SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         // ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
             // Don't cripple thread count when GPU is on!
@@ -1340,31 +1494,9 @@ void ProcessFilesAsync(HWND hWnd, const std::vector<std::wstring>& paths)
         }).detach();
      
 }
+*/
 
-
-void ProcessFiles2freeze(HWND hWnd, const std::vector<std::wstring>& paths) {
-    if (!g_converter || paths.empty()) return;
-
-    // Update converter settings from UI state are read later inside converter threads
-    g_converter->setQuality(g_state.quality);
-    g_converter->setUseGpu(g_state.useGpu);
-
-    std::wstring formatExt;
-    switch (g_state.format) {
-    case OutputFormat::JPG: formatExt = L".jpg"; break;
-    case OutputFormat::PNG: formatExt = L".png"; break;
-    case OutputFormat::WEBP: formatExt = L".webp"; break;
-    case OutputFormat::TIF: formatExt = L".tif"; break;
-    case OutputFormat::BMP: formatExt = L".bmp"; break;
-    case OutputFormat::GIF: formatExt = L".gif"; break;
-    }
-
-    std::wstring outputDir = g_state.outputFolder.empty() ? g_outputFolder : g_state.outputFolder;
-
-    for (const auto& path : paths) {
-        g_converter->convert(path, outputDir, formatExt, hWnd);
-    }
-}
+ 
 
 void DrawRoundedRect(HDC hdc, int x, int y, int w, int h, int r, COLORREF color) {
     HBRUSH brush = CreateSolidBrush(color);
@@ -2496,7 +2628,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 // === Image count ===
                 SetTextColor(memDC, RGB(220, 240, 255));
                 wchar_t buf[64];
-                swprintf_s(buf, L"%zu images", g_resultImageCount);
+                swprintf_s(buf, L"%zu images", 1+g_resultImageCount);
                 RECT r1 = { panelX, panelY + 40, panelX + panelW, panelY + 60 };
                 DrawTextW(memDC, buf, -1, &r1, DT_CENTER | DT_SINGLELINE);
 
