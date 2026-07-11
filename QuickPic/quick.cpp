@@ -23,12 +23,15 @@
 #include <vector>
  
 
+//#include <opencv4/opencv.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
+ 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/core/ocl.hpp>
+#include <opencv2/imgcodecs/legacy/constants_c.h> 
 
 // CUDA-specific headers (if available in your OpenCV build)
  #include <opencv2/cudawarping.hpp>
@@ -39,6 +42,17 @@
 
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/highgui.hpp>
+
+//////////////////////////
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#define STBI_SUPPORT_QOI
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image.h"
+#include "stb_image_write.h"
+#pragma warning(pop)
+/////////////////////////////////////////
 
 
 #define SHCHG_ASSOCCHANGED 0x08000000
@@ -218,7 +232,8 @@ void InitializePathsAndFolders();
 std::string getAvailableGpuBackend();
 void DrawRoundedRect(HDC hdc, int x, int y, int w, int h, int r, COLORREF color);
 
- 
+
+
 
 /////////////////////////////////////////////////////////////////////////////////
 // GPU Device Manager (detects CUDA or OpenCL)
@@ -387,7 +402,11 @@ private:
         ".tif", ".webp", ".ico", ".psd", ".jp2", ".j2k",
         ".pbm", ".pgm", ".ppm", ".sr", ".ras", ".hdr",
         ".exr", ".dib", ".jpe", ".jfif", ".pic", ".pxm",
-        ".pnm", ".pfm"
+        ".pnm", ".pfm",
+
+        //////////////////////stb
+     ".tga", ".gif",  ".psd", ".pic", ".hdr", ".pbm", ".pgm", ".ppm",
+    ".pam", ".avif", ".heic", ".heif", ".jxl",".qoi",".pcx"
     };
 
     bool isSupportedFormat(std::string_view extension) {
@@ -860,7 +879,25 @@ public:
         }
     }
 
+
+    ///////////////////////////////////////////////////////////////////////////////////
+
+    inline std::string ws2s(const std::wstring& wstr) {
+        if (wstr.empty()) return {};
+        int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        std::string str(size - 1, 0);
+        WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &str[0], size, nullptr, nullptr);
+        return str;
+    }
+
+    
 ////////////////////////////////////////////////////////
+
+
+
+
+
+
 
 
 
@@ -871,36 +908,36 @@ public:
     bool isUsingGpu() const { return config.useGpu && gpu_device.isAvailable(); }
 
 private:
-    void convertSingleImage(const std::wstring& inputPath, const std::wstring& outputDir,
+
+    
+
+    void  convertSingleImage(const std::wstring& inputPath, const std::wstring& outputDir,
         const std::wstring& formatExt, std::atomic<int>& completed,
         std::atomic<int>& failed, bool useGpu)
     {
         try {
-            // Convert input path to UTF-8
-            int size_needed = WideCharToMultiByte(CP_UTF8, 0, inputPath.c_str(), -1,
-                nullptr, 0, nullptr, nullptr);
-            std::string inputPathA(size_needed, 0);
-            WideCharToMultiByte(CP_UTF8, 0, inputPath.c_str(), -1,
-                inputPathA.data(), size_needed, nullptr, nullptr);
+            // Helper: Wide string → UTF-8
+            auto ws2s = [](const std::wstring& wstr) -> std::string {
+                if (wstr.empty()) return {};
+                int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                std::string str(size - 1, 0);
+                WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &str[0], size, nullptr, nullptr);
+                return str;
+                };
 
-            // Generate output path
+            std::wstring ext = inputPath.substr(inputPath.find_last_of(L'.'));
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+
+            std::string inputPathA = ws2s(inputPath);
             std::wstring outputPath = getOutputPath(inputPath, outputDir, formatExt);
-
-            // Convert output path to UTF-8
-            size_needed = WideCharToMultiByte(CP_UTF8, 0, outputPath.c_str(), -1,
-                nullptr, 0, nullptr, nullptr);
-            std::string outputPathA(size_needed, 0);
-            WideCharToMultiByte(CP_UTF8, 0, outputPath.c_str(), -1,
-                outputPathA.data(), size_needed, nullptr, nullptr);
+            std::string outputPathA = ws2s(outputPath);
 
             // Set compression parameters based on format
             std::vector<int> compression_params;
-
             if (formatExt == L".jpg" || formatExt == L".jpeg") {
                 compression_params = { cv::IMWRITE_JPEG_QUALITY, config.quality };
             }
             else if (formatExt == L".png") {
-                // PNG compression: 0-9 (0=no compression, 9=max compression)
                 int png_compression = std::max(0, std::min(9, (100 - config.quality) / 10));
                 compression_params = { cv::IMWRITE_PNG_COMPRESSION, png_compression };
             }
@@ -908,87 +945,261 @@ private:
                 compression_params = { cv::IMWRITE_WEBP_QUALITY, config.quality };
             }
             else if (formatExt == L".tif" || formatExt == L".tiff") {
-                // TIFF compression: 0=none, 1=LZW, 2=JPEG, 3=PACKBITS, 4=DEFLATE
-                compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 1 }; // LZW compression
-            }
-            // For BMP and GIF, no compression parameters needed
-            else if (formatExt == L".bmp") {
-                compression_params = {}; // BMP has no compression
-            }
-            else if (formatExt == L".gif") {
-                // Note: OpenCV may have limited GIF support
-                compression_params = {};
-            }
-            else {
-                // Default to JPEG quality for unknown formats
-                compression_params = { cv::IMWRITE_JPEG_QUALITY, config.quality };
+                compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 1 };
             }
 
-            // Build AppState snapshot from global g_state (thread-safe copy)
-            AppState stateSnapshot;
-            stateSnapshot.quality = g_state.quality;
-            stateSnapshot.doResize = g_state.doResize;
-            stateSnapshot.doColorConvert = g_state.doColorConvert;
-            stateSnapshot.doDenoise = g_state.doDenoise;
-            stateSnapshot.resizePercent = g_state.resizePercent;
+            AppState stateSnapshot = g_state;
 
-            // New fields for color conversion
-            stateSnapshot.colorMode = g_state.colorMode;
-
-            // New fields for denoise control
-            stateSnapshot.denoiseStrength = g_state.denoiseStrength;
-            stateSnapshot.denoiseTemplateWindowSize = g_state.denoiseTemplateWindowSize;
-            stateSnapshot.denoiseSearchWindowSize = g_state.denoiseSearchWindowSize;
-
-            // Resize input field
-            stateSnapshot.resizeInput = g_state.resizeInput;
-            stateSnapshot.resizeInputActive = g_state.resizeInputActive;
-
-            // Debug output
 #ifdef _DEBUG
             std::wcout << L"Converting: " << inputPath << L" -> " << outputPath << std::endl;
-            std::cout << "Settings: Resize=" << (stateSnapshot.doResize ? "Yes" : "No");
-            if (stateSnapshot.doResize) std::cout << " (" << stateSnapshot.resizePercent << "%)";
-            std::cout << ", ColorConvert=" << (stateSnapshot.doColorConvert ? "Yes" : "No");
-            if (stateSnapshot.doColorConvert) std::cout << " (Mode=" << (int)stateSnapshot.colorMode << ")";
-            std::cout << ", Denoise=" << (stateSnapshot.doDenoise ? "Yes" : "No");
-            if (stateSnapshot.doDenoise) std::cout << " (Strength=" << stateSnapshot.denoiseStrength << ")";
-            std::cout << std::endl;
 #endif
 
-            bool success = false;
+            // === STEP 1: TRY TO LOAD IMAGE (OpenCV first, STB fallback) ===
+            cv::Mat image = cv::imread(inputPathA, cv::IMREAD_UNCHANGED);
+            bool loadedWithOpenCV = !image.empty();
+            bool usedSTB = false;
 
-            // Choose the appropriate conversion pipeline
-            if (useGpu && gpu_device.isAvailable()) {
-                if (gpu_device.isCuda()) {
-                    // CUDA-accelerated pipeline
-                    success = convertImageCUDA(inputPathA, outputPathA, compression_params, stateSnapshot);
+            // If OpenCV failed, try STB
+            if (!loadedWithOpenCV) {
+                int w, h, channels;
+                unsigned char* data = stbi_load(inputPathA.c_str(), &w, &h, &channels, 0);
+
+                if (!data) {
+                    // Both loaders failed
+                    failed++;
+#ifdef _DEBUG
+                    std::wcout << L"Failed to load: " << inputPath << std::endl;
+#endif
+                    return;
+                }
+
+                usedSTB = true;
+
+                // Convert STB data → OpenCV Mat
+                // STB loads as RGB/RGBA, need to convert to BGR/BGRA for OpenCV
+                if (channels == 4) {
+                    image = cv::Mat(h, w, CV_8UC4, data);
+                    cv::cvtColor(image, image, cv::COLOR_RGBA2BGRA);
+                }
+                else if (channels == 3) {
+                    image = cv::Mat(h, w, CV_8UC3, data);
+                    cv::cvtColor(image, image, cv::COLOR_RGB2BGR);
+                }
+                else if (channels == 1) {
+                    image = cv::Mat(h, w, CV_8UC1, data);
                 }
                 else {
-                    // OpenCL/UMat pipeline
-                    success = convertImageOCL(inputPathA, outputPathA, compression_params, stateSnapshot);
+                    // Unsupported channel count
+                    stbi_image_free(data);
+                    failed++;
+                    return;
+                }
+
+                // Clone to own the data before freeing STB memory
+                image = image.clone();
+                stbi_image_free(data);
+
+#ifdef _DEBUG
+                std::wcout << L"Loaded with STB: " << inputPath << L" (" << w << L"x" << h << L", " << channels << L" channels)" << std::endl;
+#endif
+            }
+
+            // === STEP 2: PROCESS THE IMAGE ===
+            cv::Mat proc = image;
+            bool success = false;
+
+            // Choose processing pipeline
+            if (useGpu && gpu_device.isAvailable() && !stateSnapshot.doDenoise) {
+                // GPU Pipeline (CUDA or OpenCL)
+                if (gpu_device.isCuda()) {
+                    // === CUDA PIPELINE ===
+                    try {
+                        cv::cuda::GpuMat gpuMat;
+                        gpuMat.upload(proc);
+                        cv::cuda::GpuMat gpuProc = gpuMat;
+
+                        // Resize
+                        if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
+                            double scale = stateSnapshot.resizePercent / 100.0;
+                            cv::Size s((int)(gpuProc.cols * scale), (int)(gpuProc.rows * scale));
+                            if (s.width > 0 && s.height > 0) {
+                                cv::cuda::GpuMat tmp;
+                                cv::cuda::resize(gpuProc, tmp, s, 0, 0, cv::INTER_LINEAR);
+                                gpuProc = tmp;
+                            }
+                        }
+
+                        // Color conversion
+                        if (stateSnapshot.doColorConvert) {
+                            try {
+                                cv::cuda::GpuMat tmp;
+                                switch (stateSnapshot.colorMode) {
+                                case AppState::BGR_3CHANNEL:
+                                    if (gpuProc.channels() == 1) {
+                                        cv::cuda::cvtColor(gpuProc, tmp, cv::COLOR_GRAY2BGR);
+                                        gpuProc = tmp;
+                                    }
+                                    else if (gpuProc.channels() == 4) {
+                                        cv::cuda::cvtColor(gpuProc, tmp, cv::COLOR_BGRA2BGR);
+                                        gpuProc = tmp;
+                                    }
+                                    break;
+                                case AppState::GRAYSCALE:
+                                    if (gpuProc.channels() == 3) {
+                                        cv::cuda::cvtColor(gpuProc, tmp, cv::COLOR_BGR2GRAY);
+                                        gpuProc = tmp;
+                                    }
+                                    else if (gpuProc.channels() == 4) {
+                                        // CUDA might not support BGRA2GRAY, fallback to CPU
+                                        gpuProc.download(proc);
+                                        cv::cvtColor(proc, proc, cv::COLOR_BGRA2GRAY);
+                                        gpuProc.upload(proc);
+                                    }
+                                    break;
+                                case AppState::RGBA_4CHANNEL:
+                                    // CUDA might not support these, fallback to CPU
+                                    gpuProc.download(proc);
+                                    if (proc.channels() == 1) {
+                                        cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGRA);
+                                    }
+                                    else if (proc.channels() == 3) {
+                                        cv::cvtColor(proc, proc, cv::COLOR_BGR2BGRA);
+                                    }
+                                    gpuProc.upload(proc);
+                                    break;
+                                }
+                            }
+                            catch (...) {
+                                // Fallback to CPU for problematic conversions
+                                gpuProc.download(proc);
+                                if (stateSnapshot.colorMode == AppState::BGR_3CHANNEL) {
+                                    if (proc.channels() == 1) cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGR);
+                                    else if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2BGR);
+                                }
+                                else if (stateSnapshot.colorMode == AppState::GRAYSCALE) {
+                                    if (proc.channels() == 3) cv::cvtColor(proc, proc, cv::COLOR_BGR2GRAY);
+                                    else if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2GRAY);
+                                }
+                                gpuProc.upload(proc);
+                            }
+                        }
+
+                        // Download final result
+                        gpuProc.download(proc);
+                    }
+                    catch (const cv::Exception& e) {
+#ifdef _DEBUG
+                        std::cout << "CUDA pipeline failed: " << e.what() << " - falling back to CPU\n";
+#endif
+                        // proc already contains the original image, continue with CPU
+                    }
+                }
+                else {
+                    // === OpenCL/UMat PIPELINE ===
+                    try {
+                        cv::UMat uProc;
+                        proc.copyTo(uProc);
+
+                        // Resize
+                        if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
+                            double scale = stateSnapshot.resizePercent / 100.0;
+                            cv::Size s((int)(uProc.cols * scale), (int)(uProc.rows * scale));
+                            if (s.width > 0 && s.height > 0) {
+                                cv::resize(uProc, uProc, s, 0, 0, cv::INTER_LINEAR);
+                            }
+                        }
+
+                        // Color conversion
+                        if (stateSnapshot.doColorConvert) {
+                            switch (stateSnapshot.colorMode) {
+                            case AppState::BGR_3CHANNEL:
+                                if (uProc.channels() == 1) cv::cvtColor(uProc, uProc, cv::COLOR_GRAY2BGR);
+                                else if (uProc.channels() == 4) cv::cvtColor(uProc, uProc, cv::COLOR_BGRA2BGR);
+                                break;
+                            case AppState::GRAYSCALE:
+                                if (uProc.channels() == 3) cv::cvtColor(uProc, uProc, cv::COLOR_BGR2GRAY);
+                                else if (uProc.channels() == 4) cv::cvtColor(uProc, uProc, cv::COLOR_BGRA2GRAY);
+                                break;
+                            case AppState::RGBA_4CHANNEL:
+                                if (uProc.channels() == 1) cv::cvtColor(uProc, uProc, cv::COLOR_GRAY2BGRA);
+                                else if (uProc.channels() == 3) cv::cvtColor(uProc, uProc, cv::COLOR_BGR2BGRA);
+                                break;
+                            }
+                        }
+
+                        uProc.copyTo(proc);
+                    }
+                    catch (const cv::Exception& e) {
+#ifdef _DEBUG
+                        std::cout << "OpenCL pipeline failed: " << e.what() << " - falling back to CPU\n";
+#endif
+                    }
                 }
             }
             else {
-                // CPU pipeline
-                success = convertImageCPU(inputPathA, outputPathA, compression_params, stateSnapshot);
+                // === CPU PIPELINE (or denoising required) ===
+                if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
+                    double scale = stateSnapshot.resizePercent / 100.0;
+                    cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+                    if (s.width > 0 && s.height > 0) {
+                        cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
+                    }
+                }
+
+                if (stateSnapshot.doColorConvert) {
+                    switch (stateSnapshot.colorMode) {
+                    case AppState::BGR_3CHANNEL:
+                        if (proc.channels() == 1) cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGR);
+                        else if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2BGR);
+                        break;
+                    case AppState::GRAYSCALE:
+                        if (proc.channels() == 3) cv::cvtColor(proc, proc, cv::COLOR_BGR2GRAY);
+                        else if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2GRAY);
+                        break;
+                    case AppState::RGBA_4CHANNEL:
+                        if (proc.channels() == 1) cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGRA);
+                        else if (proc.channels() == 3) cv::cvtColor(proc, proc, cv::COLOR_BGR2BGRA);
+                        break;
+                    }
+                }
+
+                if (stateSnapshot.doDenoise) {
+                    int h = stateSnapshot.denoiseStrength;
+                    int templateWindowSize = stateSnapshot.denoiseTemplateWindowSize;
+                    int searchWindowSize = stateSnapshot.denoiseSearchWindowSize;
+
+                    if (proc.channels() >= 3) {
+                        cv::Mat tmp;
+                        cv::fastNlMeansDenoisingColored(proc, tmp, h, h,
+                            templateWindowSize, searchWindowSize);
+                        proc = tmp;
+                    }
+                    else {
+                        cv::Mat tmp;
+                        cv::fastNlMeansDenoising(proc, tmp, h,
+                            templateWindowSize, searchWindowSize);
+                        proc = tmp;
+                    }
+                }
             }
+
+            // === STEP 3: SAVE THE RESULT ===
+            success = cv::imwrite(outputPathA, proc, compression_params);
 
             if (success) {
                 completed++;
 #ifdef _DEBUG
-                std::wcout << L"Success: " << outputPath << std::endl;
+                std::wcout << L"Success: " << outputPath << (usedSTB ? L" (STB loader)" : L"") << std::endl;
 #endif
             }
             else {
                 failed++;
 #ifdef _DEBUG
-                std::wcout << L"Failed: " << inputPath << std::endl;
+                std::wcout << L"Failed to save: " << outputPath << std::endl;
 #endif
             }
         }
         catch (const std::exception& e) {
-            // Log exception details in debug mode
 #ifdef _DEBUG
             std::cerr << "Exception in convertSingleImage: " << e.what() << std::endl;
 #endif
@@ -1001,9 +1212,319 @@ private:
             failed++;
         }
     }
+
+
+ 
+    /*
+ 
+void  convertSingleImage(const std::wstring& inputPath, const std::wstring& outputDir,
+    const std::wstring& formatExt, std::atomic<int>& completed,
+    std::atomic<int>& failed, bool useGpu)
+{
+    try {
+        // Helper: Wide string → UTF-8
+        auto ws2s = [](const std::wstring& wstr) -> std::string {
+            if (wstr.empty()) return {};
+            int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            std::string str(size - 1, 0);
+            WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &str[0], size, nullptr, nullptr);
+            return str;
+            };
+
+        std::wstring ext = inputPath.substr(inputPath.find_last_of(L'.'));
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+
+        std::string inputPathA = ws2s(inputPath);
+        std::wstring outputPath = getOutputPath(inputPath, outputDir, formatExt);
+        std::string outputPathA = ws2s(outputPath);
+
+        // Set compression parameters based on format
+        std::vector<int> compression_params;
+        if (formatExt == L".jpg" || formatExt == L".jpeg") {
+            compression_params = { cv::IMWRITE_JPEG_QUALITY, config.quality };
+        }
+        else if (formatExt == L".png") {
+            int png_compression = std::max(0, std::min(9, (100 - config.quality) / 10));
+            compression_params = { cv::IMWRITE_PNG_COMPRESSION, png_compression };
+        }
+        else if (formatExt == L".webp") {
+            compression_params = { cv::IMWRITE_WEBP_QUALITY, config.quality };
+        }
+        else if (formatExt == L".tif" || formatExt == L".tiff") {
+            compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 1 };
+        }
+
+        AppState stateSnapshot = g_state;
+
+#ifdef _DEBUG
+        std::wcout << L"Converting: " << inputPath << L" -> " << outputPath << std::endl;
+#endif
+
+        // === STEP 1: TRY TO LOAD IMAGE (OpenCV first, STB fallback) ===
+        cv::Mat image = cv::imread(inputPathA, cv::IMREAD_UNCHANGED);
+        bool loadedWithOpenCV = !image.empty();
+        bool usedSTB = false;
+
+        // If OpenCV failed, try STB
+        if (!loadedWithOpenCV) {
+            int w, h, channels;
+            unsigned char* data = stbi_load(inputPathA.c_str(), &w, &h, &channels, 0);
+
+            if (!data) {
+                // Both loaders failed
+                failed++;
+#ifdef _DEBUG
+                std::wcout << L"Failed to load: " << inputPath << std::endl;
+#endif
+                return;
+            }
+
+            usedSTB = true;
+
+            // Convert STB data → OpenCV Mat
+            // STB loads as RGB/RGBA, need to convert to BGR/BGRA for OpenCV
+            if (channels == 4) {
+                image = cv::Mat(h, w, CV_8UC4, data);
+                cv::cvtColor(image, image, cv::COLOR_RGBA2BGRA);
+            }
+            else if (channels == 3) {
+                image = cv::Mat(h, w, CV_8UC3, data);
+                cv::cvtColor(image, image, cv::COLOR_RGB2BGR);
+            }
+            else if (channels == 1) {
+                image = cv::Mat(h, w, CV_8UC1, data);
+            }
+            else {
+                // Unsupported channel count
+                stbi_image_free(data);
+                failed++;
+                return;
+            }
+
+            // Clone to own the data before freeing STB memory
+            image = image.clone();
+            stbi_image_free(data);
+
+#ifdef _DEBUG
+            std::wcout << L"Loaded with STB: " << inputPath << L" (" << w << L"x" << h << L", " << channels << L" channels)" << std::endl;
+#endif
+        }
+
+        // === STEP 2: PROCESS THE IMAGE ===
+        cv::Mat proc = image;
+        bool success = false;
+
+        // Choose processing pipeline
+        if (useGpu && gpu_device.isAvailable() && !stateSnapshot.doDenoise) {
+            // GPU Pipeline (CUDA or OpenCL)
+            if (gpu_device.isCuda()) {
+                // === CUDA PIPELINE ===
+                try {
+                    cv::cuda::GpuMat gpuMat;
+                    gpuMat.upload(proc);
+                    cv::cuda::GpuMat gpuProc = gpuMat;
+
+                    // Resize
+                    if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
+                        double scale = stateSnapshot.resizePercent / 100.0;
+                        cv::Size s((int)(gpuProc.cols * scale), (int)(gpuProc.rows * scale));
+                        if (s.width > 0 && s.height > 0) {
+                            cv::cuda::GpuMat tmp;
+                            cv::cuda::resize(gpuProc, tmp, s, 0, 0, cv::INTER_LINEAR);
+                            gpuProc = tmp;
+                        }
+                    }
+
+                    // Color conversion
+                    if (stateSnapshot.doColorConvert) {
+                        try {
+                            cv::cuda::GpuMat tmp;
+                            switch (stateSnapshot.colorMode) {
+                            case AppState::BGR_3CHANNEL:
+                                if (gpuProc.channels() == 1) {
+                                    cv::cuda::cvtColor(gpuProc, tmp, cv::COLOR_GRAY2BGR);
+                                    gpuProc = tmp;
+                                }
+                                else if (gpuProc.channels() == 4) {
+                                    cv::cuda::cvtColor(gpuProc, tmp, cv::COLOR_BGRA2BGR);
+                                    gpuProc = tmp;
+                                }
+                                break;
+                            case AppState::GRAYSCALE:
+                                if (gpuProc.channels() == 3) {
+                                    cv::cuda::cvtColor(gpuProc, tmp, cv::COLOR_BGR2GRAY);
+                                    gpuProc = tmp;
+                                }
+                                else if (gpuProc.channels() == 4) {
+                                    // CUDA might not support BGRA2GRAY, fallback to CPU
+                                    gpuProc.download(proc);
+                                    cv::cvtColor(proc, proc, cv::COLOR_BGRA2GRAY);
+                                    gpuProc.upload(proc);
+                                }
+                                break;
+                            case AppState::RGBA_4CHANNEL:
+                                // CUDA might not support these, fallback to CPU
+                                gpuProc.download(proc);
+                                if (proc.channels() == 1) {
+                                    cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGRA);
+                                }
+                                else if (proc.channels() == 3) {
+                                    cv::cvtColor(proc, proc, cv::COLOR_BGR2BGRA);
+                                }
+                                gpuProc.upload(proc);
+                                break;
+                            }
+                        }
+                        catch (...) {
+                            // Fallback to CPU for problematic conversions
+                            gpuProc.download(proc);
+                            if (stateSnapshot.colorMode == AppState::BGR_3CHANNEL) {
+                                if (proc.channels() == 1) cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGR);
+                                else if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2BGR);
+                            }
+                            else if (stateSnapshot.colorMode == AppState::GRAYSCALE) {
+                                if (proc.channels() == 3) cv::cvtColor(proc, proc, cv::COLOR_BGR2GRAY);
+                                else if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2GRAY);
+                            }
+                            gpuProc.upload(proc);
+                        }
+                    }
+
+                    // Download final result
+                    gpuProc.download(proc);
+                }
+                catch (const cv::Exception& e) {
+#ifdef _DEBUG
+                    std::cout << "CUDA pipeline failed: " << e.what() << " - falling back to CPU\n";
+#endif
+                    // proc already contains the original image, continue with CPU
+                }
+            }
+            else {
+                // === OpenCL/UMat PIPELINE ===
+                try {
+                    cv::UMat uProc;
+                    proc.copyTo(uProc);
+
+                    // Resize
+                    if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
+                        double scale = stateSnapshot.resizePercent / 100.0;
+                        cv::Size s((int)(uProc.cols * scale), (int)(uProc.rows * scale));
+                        if (s.width > 0 && s.height > 0) {
+                            cv::resize(uProc, uProc, s, 0, 0, cv::INTER_LINEAR);
+                        }
+                    }
+
+                    // Color conversion
+                    if (stateSnapshot.doColorConvert) {
+                        switch (stateSnapshot.colorMode) {
+                        case AppState::BGR_3CHANNEL:
+                            if (uProc.channels() == 1) cv::cvtColor(uProc, uProc, cv::COLOR_GRAY2BGR);
+                            else if (uProc.channels() == 4) cv::cvtColor(uProc, uProc, cv::COLOR_BGRA2BGR);
+                            break;
+                        case AppState::GRAYSCALE:
+                            if (uProc.channels() == 3) cv::cvtColor(uProc, uProc, cv::COLOR_BGR2GRAY);
+                            else if (uProc.channels() == 4) cv::cvtColor(uProc, uProc, cv::COLOR_BGRA2GRAY);
+                            break;
+                        case AppState::RGBA_4CHANNEL:
+                            if (uProc.channels() == 1) cv::cvtColor(uProc, uProc, cv::COLOR_GRAY2BGRA);
+                            else if (uProc.channels() == 3) cv::cvtColor(uProc, uProc, cv::COLOR_BGR2BGRA);
+                            break;
+                        }
+                    }
+
+                    uProc.copyTo(proc);
+                }
+                catch (const cv::Exception& e) {
+#ifdef _DEBUG
+                    std::cout << "OpenCL pipeline failed: " << e.what() << " - falling back to CPU\n";
+#endif
+                }
+            }
+        }
+        else {
+            // === CPU PIPELINE (or denoising required) ===
+            if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
+                double scale = stateSnapshot.resizePercent / 100.0;
+                cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+                if (s.width > 0 && s.height > 0) {
+                    cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
+                }
+            }
+
+            if (stateSnapshot.doColorConvert) {
+                switch (stateSnapshot.colorMode) {
+                case AppState::BGR_3CHANNEL:
+                    if (proc.channels() == 1) cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGR);
+                    else if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2BGR);
+                    break;
+                case AppState::GRAYSCALE:
+                    if (proc.channels() == 3) cv::cvtColor(proc, proc, cv::COLOR_BGR2GRAY);
+                    else if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2GRAY);
+                    break;
+                case AppState::RGBA_4CHANNEL:
+                    if (proc.channels() == 1) cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGRA);
+                    else if (proc.channels() == 3) cv::cvtColor(proc, proc, cv::COLOR_BGR2BGRA);
+                    break;
+                }
+            }
+
+            if (stateSnapshot.doDenoise) {
+                int h = stateSnapshot.denoiseStrength;
+                int templateWindowSize = stateSnapshot.denoiseTemplateWindowSize;
+                int searchWindowSize = stateSnapshot.denoiseSearchWindowSize;
+
+                if (proc.channels() >= 3) {
+                    cv::Mat tmp;
+                    cv::fastNlMeansDenoisingColored(proc, tmp, h, h,
+                        templateWindowSize, searchWindowSize);
+                    proc = tmp;
+                }
+                else {
+                    cv::Mat tmp;
+                    cv::fastNlMeansDenoising(proc, tmp, h,
+                        templateWindowSize, searchWindowSize);
+                    proc = tmp;
+                }
+            }
+        }
+
+        // === STEP 3: SAVE THE RESULT ===
+        success = cv::imwrite(outputPathA, proc, compression_params);
+
+        if (success) {
+            completed++;
+#ifdef _DEBUG
+            std::wcout << L"Success: " << outputPath << (usedSTB ? L" (STB loader)" : L"") << std::endl;
+#endif
+        }
+        else {
+            failed++;
+#ifdef _DEBUG
+            std::wcout << L"Failed to save: " << outputPath << std::endl;
+#endif
+        }
+    }
+    catch (const std::exception& e) {
+#ifdef _DEBUG
+        std::cerr << "Exception in convertSingleImage: " << e.what() << std::endl;
+#endif
+        failed++;
+    }
+    catch (...) {
+#ifdef _DEBUG
+        std::cerr << "Unknown exception in convertSingleImage" << std::endl;
+#endif
+        failed++;
+    }
+}
+*/
+
+
+
 };
 
-
+ 
 
 
 
@@ -2783,3 +3304,7 @@ void PlayGodTierAnimeEnding(HDC hdc, HWND hWnd)
     InvalidateRect(hWnd, nullptr, FALSE);
    
 }
+
+
+
+ 
