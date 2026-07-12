@@ -1,4 +1,4 @@
-﻿#include "framework.h"
+#include "framework.h"
 #include "Quick.h"
  
 #include <shellapi.h>
@@ -42,6 +42,8 @@
 
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/dnn.hpp>
+#include <opencv2/dnn/dnn.hpp>
 
 //////////////////////////
 #pragma warning(push)
@@ -194,6 +196,8 @@ struct AppState {
     bool doResize = false;
     bool doColorConvert = false;
     bool doDenoise = false;
+    bool doUpscale = false;
+    int upscaleFactor = 4;
     
     int resizePercent = 100;
     
@@ -526,6 +530,39 @@ private:
                 if (s.width > 0 && s.height > 0) cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
             }
 
+            if (state.doUpscale) {
+                try {
+                    cv::Mat cpuTmp;
+                    proc.copyTo(cpuTmp);
+                    thread_local cv::dnn::Net sr_ocl_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
+                    thread_local cv::dnn::Net sr_ocl_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
+                    thread_local cv::dnn::Net sr_ocl_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
+                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_ocl_2 : ((state.upscaleFactor == 3) ? sr_ocl_3 : sr_ocl_4);
+                    if (!sr.empty()) {
+                        cv::Mat blob = cv::dnn::blobFromImage(proc, 1.0, cv::Size(), cv::Scalar(), true, false);
+                        sr.setInput(blob);
+                        cv::Mat out = sr.forward();
+                        
+                        int channels = out.size[1];
+                        int rows = out.size[2];
+                        int cols = out.size[3];
+                        
+                        std::vector<cv::Mat> planes;
+                        for (int i = 0; i < channels; ++i) {
+                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
+                            planes.push_back(plane);
+                        }
+                        
+                        cv::Mat merged;
+                        cv::merge(planes, merged);
+                        merged.convertTo(cpuTmp, CV_8U);
+                    }
+                    cpuTmp.copyTo(proc);
+                } catch (...) {
+                    // Fallback
+                }
+            }
+
             if (state.doColorConvert) {
                 // NEW COLOR CONVERSION LOGIC
                 switch (state.colorMode) {
@@ -609,6 +646,42 @@ private:
              
 
             // Color convert - NOTE: CUDA color conversion may have limited options
+            if (state.doUpscale) {
+                try {
+                    cv::Mat cpuTmp;
+                    proc.download(cpuTmp);
+                    thread_local cv::dnn::Net sr_cuda_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
+                    thread_local cv::dnn::Net sr_cuda_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
+                    thread_local cv::dnn::Net sr_cuda_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
+                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_cuda_2 : ((state.upscaleFactor == 3) ? sr_cuda_3 : sr_cuda_4);
+                    if (!sr.empty()) {
+                        sr.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+                        sr.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+                        
+                        cv::Mat blob = cv::dnn::blobFromImage(cpuTmp, 1.0, cv::Size(), cv::Scalar(), true, false);
+                        sr.setInput(blob);
+                        cv::Mat out = sr.forward();
+                        
+                        int channels = out.size[1];
+                        int rows = out.size[2];
+                        int cols = out.size[3];
+                        
+                        std::vector<cv::Mat> planes;
+                        for (int i = 0; i < channels; ++i) {
+                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
+                            planes.push_back(plane);
+                        }
+                        
+                        cv::Mat merged;
+                        cv::merge(planes, merged);
+                        merged.convertTo(cpuTmp, CV_8U);
+                    }
+                    proc.upload(cpuTmp);
+                } catch (...) {
+                    // Fallback
+                }
+            }
+
             if (state.doColorConvert) {
                 cv::cuda::GpuMat tmp;
 
@@ -736,6 +809,39 @@ private:
                 double scale = state.resizePercent / 100.0;
                 cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
                 if (s.width > 0 && s.height > 0) cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
+            }
+
+            if (state.doUpscale) {
+                try {
+                    cv::Mat cpuTmp;
+                    proc.copyTo(cpuTmp);
+                    thread_local cv::dnn::Net sr_ocl_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
+                    thread_local cv::dnn::Net sr_ocl_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
+                    thread_local cv::dnn::Net sr_ocl_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
+                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_ocl_2 : ((state.upscaleFactor == 3) ? sr_ocl_3 : sr_ocl_4);
+                    if (!sr.empty()) {
+                        cv::Mat blob = cv::dnn::blobFromImage(cpuTmp, 1.0, cv::Size(), cv::Scalar(), true, false);
+                        sr.setInput(blob);
+                        cv::Mat out = sr.forward();
+                        
+                        int channels = out.size[1];
+                        int rows = out.size[2];
+                        int cols = out.size[3];
+                        
+                        std::vector<cv::Mat> planes;
+                        for (int i = 0; i < channels; ++i) {
+                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
+                            planes.push_back(plane);
+                        }
+                        
+                        cv::Mat merged;
+                        cv::merge(planes, merged);
+                        merged.convertTo(cpuTmp, CV_8U);
+                    }
+                    cpuTmp.copyTo(proc);
+                } catch (...) {
+                    // Fallback
+                }
             }
 
             if (state.doColorConvert) {
@@ -1688,7 +1794,8 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     HWND hWnd = CreateWindowExW(
         WS_EX_COMPOSITED |           // Critical: forces full double-buffering during move/size
         WS_EX_APPWINDOW |            // Shows in taskbar + Alt+Tab
-        WS_EX_CONTROLPARENT,         // Better keyboard navigation (optional)
+        WS_EX_CONTROLPARENT |        // Better keyboard navigation (optional)
+        WS_EX_LAYERED,               // Add layered flag for translucency
 
         szWindowClass, szTitle,
         WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
@@ -1701,8 +1808,21 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
         return FALSE;
     }
 
+    SetLayeredWindowAttributes(hWnd, 0, 240, LWA_ALPHA);
+
     g_hWnd = hWnd;
     DragAcceptFiles(hWnd, TRUE);
+
+    if (g_converter && !g_converter->isGpuAvailable()) {
+        try {
+            int cudaCount = cv::cuda::getCudaEnabledDeviceCount();
+            if (cudaCount == 0) {
+                MessageBoxW(hWnd, L"NVIDIA CUDA GPU not detected. Using CPU. Upscaling and conversion will be slower.", L"GPU Not Found", MB_OK | MB_ICONWARNING);
+            }
+        } catch (...) {
+            MessageBoxW(hWnd, L"NVIDIA CUDA GPU not detected. Using CPU. Upscaling and conversion will be slower.", L"GPU Not Found", MB_OK | MB_ICONWARNING);
+        }
+    }
 
      
 
@@ -1860,6 +1980,10 @@ void ProcessFilesAsync(HWND hWnd, const std::vector<std::wstring>& paths)
 
         pool.wait();
 
+        while (processed.load() < (int)allImages.size()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
         double sec = (double)(clock() - start) / CLOCKS_PER_SEC;
 
         g_resultImageCount = succeeded.load();
@@ -1951,6 +2075,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
     const int CHK_DENOISE_X = CHK_RESIZE_X;
     const int CHK_DENOISE_Y = CHK_COLOR_Y + 40;
+
+    const int CHK_UPSCALE_X = CHK_DENOISE_X;
+    const int CHK_UPSCALE_Y = CHK_DENOISE_Y + 40;
 
     // Resize input field
     const int RESIZE_INPUT_X = CHK_RESIZE_X + 120;
@@ -2207,6 +2334,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             else if (x >= CHK_DENOISE_X && x <= CHK_DENOISE_X + CHK_SIZE &&
                 y >= CHK_DENOISE_Y && y <= CHK_DENOISE_Y + CHK_SIZE) {
                 g_state.doDenoise = !g_state.doDenoise;
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+
+            // Upscale checkbox
+            else if (x >= CHK_UPSCALE_X && x <= CHK_UPSCALE_X + CHK_SIZE &&
+                y >= CHK_UPSCALE_Y && y <= CHK_UPSCALE_Y + CHK_SIZE) {
+                g_state.doUpscale = !g_state.doUpscale;
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+            
+            // Upscale label click to cycle factor
+            else if (x >= CHK_UPSCALE_X + CHK_SIZE && x <= CHK_UPSCALE_X + 200 &&
+                     y >= CHK_UPSCALE_Y && y <= CHK_UPSCALE_Y + CHK_SIZE) {
+                if (g_state.upscaleFactor == 2) g_state.upscaleFactor = 3;
+                else if (g_state.upscaleFactor == 3) g_state.upscaleFactor = 4;
+                else g_state.upscaleFactor = 2;
                 InvalidateRect(hWnd, NULL, FALSE);
                 handled = true;
             }
@@ -2775,6 +2920,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                                    CHK_DENOISE_X + 250, CHK_DENOISE_Y + CHK_SIZE + 12 };
             DrawTextW(memDC, L"Apply Denoising", -1, &rDenoiseLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
+            // 4. Upscale Checkbox
+            DrawRoundedRect(memDC, CHK_UPSCALE_X, CHK_UPSCALE_Y, CHK_SIZE, CHK_SIZE, 4,
+                g_state.doUpscale ? RGB(59, 130, 246) : RGB(30, 50, 90));
+            if (g_state.doUpscale) {
+                SetTextColor(memDC, RGB(255, 255, 255));
+                RECT rCheck = { CHK_UPSCALE_X, CHK_UPSCALE_Y, CHK_UPSCALE_X + CHK_SIZE, CHK_UPSCALE_Y + CHK_SIZE };
+                DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+
+            SetTextColor(memDC, RGB(200, 220, 255));
+            RECT rUpscaleLabel = { CHK_UPSCALE_X + CHK_SIZE + 10, CHK_UPSCALE_Y,
+                                   CHK_UPSCALE_X + 250, CHK_UPSCALE_Y + CHK_SIZE + 12 };
+            wchar_t upscaleStr[32];
+            swprintf_s(upscaleStr, L"Upscale %dx (EDSR)", g_state.upscaleFactor);
+            DrawTextW(memDC, upscaleStr, -1, &rUpscaleLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
 
             // Denoise slider (only show when denoise is checked)
             if (g_state.doDenoise) {
@@ -3016,7 +3177,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 // === Image count ===
                 SetTextColor(memDC, RGB(220, 240, 255));
                 wchar_t buf[64];
-                swprintf_s(buf, L"%zu images", 1+g_resultImageCount);
+                swprintf_s(buf, L"%zu images", g_resultImageCount);
                 RECT r1 = { panelX, panelY + 40, panelX + panelW, panelY + 60 };
                 DrawTextW(memDC, buf, -1, &r1, DT_CENTER | DT_SINGLELINE);
 
@@ -3165,24 +3326,23 @@ void EnableDarkMode() {
 
 void InitializePathsAndFolders()
 {
-    // Get full path to the running .exe (e.g. C:\Apps\QuickConvert.exe)
-    WCHAR exePath[MAX_PATH] = { 0 };
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-
-    // Remove the filename → leave only directory
-    PathRemoveFileSpecW(exePath);
-
-   
-    swprintf_s(g_outputFolder, MAX_PATH, L"%s\\Converted", exePath);
+    PWSTR pszPath = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &pszPath))) {
+        swprintf_s(g_outputFolder, MAX_PATH, L"%s\\QuickConvert", pszPath);
+        CoTaskMemFree(pszPath);
+    } else {
+        // Fallback to executable directory
+        WCHAR exePath[MAX_PATH] = { 0 };
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        PathRemoveFileSpecW(exePath);
+        swprintf_s(g_outputFolder, MAX_PATH, L"%s\\Converted", exePath);
+    }
 
     // Create the folder if it doesn't exist
     if (!PathIsDirectoryW(g_outputFolder))
     {
         CreateDirectoryW(g_outputFolder, nullptr);
     }
-
-    // Always ensure trailing backslash
-   // PathAddBackslashW(g_outputFolder);
 }
 
 
