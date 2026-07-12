@@ -553,7 +553,9 @@ private:
                     }
 
                     if (sr) {
-                        sr->upsample(proc, proc);
+                        cv::Mat upscaled;
+                        sr->upsample(proc, upscaled);
+                        proc = upscaled;
                     }
                 } catch (...) {
                     // Fallback
@@ -667,7 +669,9 @@ private:
                     }
 
                     if (sr) {
-                        sr->upsample(cpuTmp, cpuTmp);
+                        cv::Mat upscaled;
+                        sr->upsample(cpuTmp, upscaled);
+                        cpuTmp = upscaled;
                     }
                     proc.upload(cpuTmp);
                 } catch (...) {
@@ -828,7 +832,9 @@ private:
                     }
 
                     if (sr) {
-                        sr->upsample(cpuTmp, cpuTmp);
+                        cv::Mat upscaled;
+                        sr->upsample(cpuTmp, upscaled);
+                        cpuTmp = upscaled;
                     }
                     cpuTmp.copyTo(proc);
                 } catch (...) {
