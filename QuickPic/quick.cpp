@@ -1,6 +1,6 @@
 ﻿#include "framework.h"
 #include "Quick.h"
- 
+
 #include <shellapi.h>
 #include <filesystem>
 #include <functional>
@@ -21,17 +21,17 @@
 #include <thread>
 #include <chrono>
 #include <vector>
- 
+
 
 //#include <opencv4/opencv.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
- 
+
 #include <opencv2/imgproc.hpp>
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/core/ocl.hpp>
-#include <opencv2/imgcodecs/legacy/constants_c.h> 
+#include <opencv2/imgcodecs/legacy/constants_c.h>
 
 // CUDA-specific headers (if available in your OpenCV build)
  #include <opencv2/cudawarping.hpp>
@@ -42,6 +42,8 @@
 
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/dnn.hpp>
+#include <opencv2/dnn/dnn.hpp>
 
 //////////////////////////
 #pragma warning(push)
@@ -56,7 +58,7 @@
 
 
 #define SHCHG_ASSOCCHANGED 0x08000000
- 
+
 
 #pragma comment(lib, "opencv_world4130.lib")
 #pragma comment(lib, "shell32.lib")
@@ -93,7 +95,7 @@ WCHAR szWindowClass[MAX_LOADSTRING];
 
 // Global output folder
 WCHAR g_outputFolder[MAX_PATH] = L"";
- 
+
 
 
 // Icon positions and sizes
@@ -123,7 +125,7 @@ const wchar_t* formats[] = { L"JPG", L"PNG", L"WEBP", L"TIF", L"BMP", L"GIF" };
 const int FMT_X = 380;
 const int FMT_Y = PANEL_Y + 25;
 const int FMT_X2 = 380;
-const int FMT_Y2 = PANEL_Y + 25; 
+const int FMT_Y2 = PANEL_Y + 25;
 const int FMT_ROW2_Y = FMT_Y2 + FMT_BTN_H + 10;
 
 
@@ -143,9 +145,9 @@ std::atomic<int> g_lastFailedCount = 0;
   constexpr int MINIMIZE_ICON_X = 7;
   constexpr int MINIMIZE_ICON_Y = 7;
   constexpr int MINIMIZE_ICON_SIZE = 36;
-  bool g_hoverMinimize = false;  // Add with your other ho 
+  bool g_hoverMinimize = false;  // Add with your other ho
    HICON g_hAppIcon = nullptr;
- 
+
   clock_t g_minimizeAnimTime = 0;
   int     g_minimizeAnimFrame = 0; // 0=/  1=-  2=\  3=|
   constexpr int MINIMIZE_ANIM_INTERVAL = 120;  // ms per frame
@@ -169,9 +171,9 @@ std::atomic<int> g_lastFailedCount = 0;
   void DrawGradientRect(HDC hdc, int x, int y, int w, int h,
       COLORREF color1, COLORREF color2, bool horizontal );
 
- 
+
   void PlayGodTierAnimeEnding(HDC hdc, HWND hWnd);
-  
+
 
 
 enum class OutputFormat {
@@ -194,9 +196,11 @@ struct AppState {
     bool doResize = false;
     bool doColorConvert = false;
     bool doDenoise = false;
-    
+    bool doUpscale = false;
+    int upscaleFactor = 4;
+
     int resizePercent = 100;
-    
+
     // Color conversion options
     enum ColorMode {
         AUTO_DETECT = 0,
@@ -205,12 +209,12 @@ struct AppState {
         RGBA_4CHANNEL = 3
     };
     ColorMode colorMode = AUTO_DETECT;
-    
+
     // Denoise options
     int denoiseStrength = 3;  // 1-10 scale
     int denoiseTemplateWindowSize = 7;
     int denoiseSearchWindowSize = 21;
-    
+
     std::wstring resizeInput = L"100";
     bool resizeInputActive = false;
 };
@@ -311,7 +315,7 @@ public:
 };
 
 /////////////////////////////////////////////////////////////////////////////////
-// ThreadPool 
+// ThreadPool
 ////////////////////////////////////////////////////////////////////////////////
 class ThreadPool {
 private:
@@ -421,7 +425,7 @@ private:
         return false;
     }
 
-     
+
 
 
     void scanDirectory(const std::wstring& dirPath, std::vector<std::wstring>& imageFiles) {
@@ -476,7 +480,7 @@ private:
         return imageFiles;
     }
 
- 
+
 
 
     std::wstring getOutputPath(const std::wstring& inputPath, const std::wstring& outputDir, const std::wstring& formatExt) {
@@ -524,6 +528,39 @@ private:
                 double scale = state.resizePercent / 100.0;
                 cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
                 if (s.width > 0 && s.height > 0) cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
+            }
+
+            if (state.doUpscale) {
+                try {
+                    cv::Mat cpuTmp;
+                    proc.copyTo(cpuTmp);
+                    thread_local cv::dnn::Net sr_ocl_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
+                    thread_local cv::dnn::Net sr_ocl_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
+                    thread_local cv::dnn::Net sr_ocl_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
+                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_ocl_2 : ((state.upscaleFactor == 3) ? sr_ocl_3 : sr_ocl_4);
+                    if (!sr.empty()) {
+                        cv::Mat blob = cv::dnn::blobFromImage(proc, 1.0, cv::Size(), cv::Scalar(), true, false);
+                        sr.setInput(blob);
+                        cv::Mat out = sr.forward();
+
+                        int channels = out.size[1];
+                        int rows = out.size[2];
+                        int cols = out.size[3];
+
+                        std::vector<cv::Mat> planes;
+                        for (int i = 0; i < channels; ++i) {
+                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
+                            planes.push_back(plane);
+                        }
+
+                        cv::Mat merged;
+                        cv::merge(planes, merged);
+                        merged.convertTo(cpuTmp, CV_8U);
+                    }
+                    cpuTmp.copyTo(proc);
+                } catch (...) {
+                    // Fallback
+                }
             }
 
             if (state.doColorConvert) {
@@ -577,7 +614,7 @@ private:
             return false;
         }
     }
-     
+
 
 
 
@@ -606,9 +643,45 @@ private:
                 }
             }
 
-             
+
 
             // Color convert - NOTE: CUDA color conversion may have limited options
+            if (state.doUpscale) {
+                try {
+                    cv::Mat cpuTmp;
+                    proc.download(cpuTmp);
+                    thread_local cv::dnn::Net sr_cuda_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
+                    thread_local cv::dnn::Net sr_cuda_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
+                    thread_local cv::dnn::Net sr_cuda_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
+                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_cuda_2 : ((state.upscaleFactor == 3) ? sr_cuda_3 : sr_cuda_4);
+                    if (!sr.empty()) {
+                        sr.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+                        sr.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+
+                        cv::Mat blob = cv::dnn::blobFromImage(cpuTmp, 1.0, cv::Size(), cv::Scalar(), true, false);
+                        sr.setInput(blob);
+                        cv::Mat out = sr.forward();
+
+                        int channels = out.size[1];
+                        int rows = out.size[2];
+                        int cols = out.size[3];
+
+                        std::vector<cv::Mat> planes;
+                        for (int i = 0; i < channels; ++i) {
+                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
+                            planes.push_back(plane);
+                        }
+
+                        cv::Mat merged;
+                        cv::merge(planes, merged);
+                        merged.convertTo(cpuTmp, CV_8U);
+                    }
+                    proc.upload(cpuTmp);
+                } catch (...) {
+                    // Fallback
+                }
+            }
+
             if (state.doColorConvert) {
                 cv::cuda::GpuMat tmp;
 
@@ -736,6 +809,39 @@ private:
                 double scale = state.resizePercent / 100.0;
                 cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
                 if (s.width > 0 && s.height > 0) cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
+            }
+
+            if (state.doUpscale) {
+                try {
+                    cv::Mat cpuTmp;
+                    proc.copyTo(cpuTmp);
+                    thread_local cv::dnn::Net sr_ocl_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
+                    thread_local cv::dnn::Net sr_ocl_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
+                    thread_local cv::dnn::Net sr_ocl_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
+                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_ocl_2 : ((state.upscaleFactor == 3) ? sr_ocl_3 : sr_ocl_4);
+                    if (!sr.empty()) {
+                        cv::Mat blob = cv::dnn::blobFromImage(cpuTmp, 1.0, cv::Size(), cv::Scalar(), true, false);
+                        sr.setInput(blob);
+                        cv::Mat out = sr.forward();
+
+                        int channels = out.size[1];
+                        int rows = out.size[2];
+                        int cols = out.size[3];
+
+                        std::vector<cv::Mat> planes;
+                        for (int i = 0; i < channels; ++i) {
+                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
+                            planes.push_back(plane);
+                        }
+
+                        cv::Mat merged;
+                        cv::merge(planes, merged);
+                        merged.convertTo(cpuTmp, CV_8U);
+                    }
+                    cpuTmp.copyTo(proc);
+                } catch (...) {
+                    // Fallback
+                }
             }
 
             if (state.doColorConvert) {
@@ -890,7 +996,7 @@ public:
         return str;
     }
 
-    
+
 ////////////////////////////////////////////////////////
 
 
@@ -909,7 +1015,7 @@ public:
 
 private:
 
-    
+
 
     void  convertSingleImage(const std::wstring& inputPath, const std::wstring& outputDir,
         const std::wstring& formatExt, std::atomic<int>& completed,
@@ -1214,9 +1320,9 @@ private:
     }
 
 
- 
+
     /*
- 
+
 void  convertSingleImage(const std::wstring& inputPath, const std::wstring& outputDir,
     const std::wstring& formatExt, std::atomic<int>& completed,
     std::atomic<int>& failed, bool useGpu)
@@ -1524,7 +1630,7 @@ void  convertSingleImage(const std::wstring& inputPath, const std::wstring& outp
 
 };
 
- 
+
 
 
 
@@ -1579,7 +1685,7 @@ std::string getAvailableGpuBackend() {
 /////////////////////////////////////////////////////////////////////////////////////
 //
 //  MAIN
-// 
+//
 ////////////////////////////////////////////////////////////////////////////////////
 
 ImageConverter* g_converter = nullptr;
@@ -1688,7 +1794,8 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     HWND hWnd = CreateWindowExW(
         WS_EX_COMPOSITED |           // Critical: forces full double-buffering during move/size
         WS_EX_APPWINDOW |            // Shows in taskbar + Alt+Tab
-        WS_EX_CONTROLPARENT,         // Better keyboard navigation (optional)
+        WS_EX_CONTROLPARENT |        // Better keyboard navigation (optional)
+        WS_EX_LAYERED,               // Add layered flag for translucency
 
         szWindowClass, szTitle,
         WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
@@ -1701,12 +1808,25 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
         return FALSE;
     }
 
+    SetLayeredWindowAttributes(hWnd, 0, 240, LWA_ALPHA);
+
     g_hWnd = hWnd;
     DragAcceptFiles(hWnd, TRUE);
 
-     
+    if (g_converter && !g_converter->isGpuAvailable()) {
+        try {
+            int cudaCount = cv::cuda::getCudaEnabledDeviceCount();
+            if (cudaCount == 0) {
+                MessageBoxW(hWnd, L"NVIDIA CUDA GPU not detected. Using CPU. Upscaling and conversion will be slower.", L"GPU Not Found", MB_OK | MB_ICONWARNING);
+            }
+        } catch (...) {
+            MessageBoxW(hWnd, L"NVIDIA CUDA GPU not detected. Using CPU. Upscaling and conversion will be slower.", L"GPU Not Found", MB_OK | MB_ICONWARNING);
+        }
+    }
 
-     
+
+
+
 
 
 
@@ -1860,6 +1980,10 @@ void ProcessFilesAsync(HWND hWnd, const std::vector<std::wstring>& paths)
 
         pool.wait();
 
+        while (processed.load() < (int)allImages.size()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
         double sec = (double)(clock() - start) / CLOCKS_PER_SEC;
 
         g_resultImageCount = succeeded.load();
@@ -1880,8 +2004,8 @@ void ProcessFilesAsync(HWND hWnd, const std::vector<std::wstring>& paths)
         }).detach();
 }
 
- 
- 
+
+
 
 void DrawRoundedRect(HDC hdc, int x, int y, int w, int h, int r, COLORREF color) {
     HBRUSH brush = CreateSolidBrush(color);
@@ -1934,7 +2058,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     const int SLIDER_W = 200;
     const int SLIDER_H = 6;
 
-    
+
     static std::atomic<int> g_lastFailedCount = 0;   // Remember last failed count
     const int SETTINGS_PANEL_X = (WINDOW_WIDTH / 2) + 30;
     const int SETTINGS_PANEL_Y = PANEL_Y + 140;
@@ -1951,6 +2075,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
     const int CHK_DENOISE_X = CHK_RESIZE_X;
     const int CHK_DENOISE_Y = CHK_COLOR_Y + 40;
+
+    const int CHK_UPSCALE_X = CHK_DENOISE_X;
+    const int CHK_UPSCALE_Y = CHK_DENOISE_Y + 40;
 
     // Resize input field
     const int RESIZE_INPUT_X = CHK_RESIZE_X + 120;
@@ -1975,7 +2102,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     static bool g_bIsDraggingDenoiseSlider = false;
     static bool g_hoverFolder = false;
     static bool g_hoverGpu = false;
-   
+
 
 
     switch (message) {
@@ -2015,8 +2142,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         g_minimizeAnimTime = clock();
 
 
-        
-       
+
+
 
         // Create edit control for resize input
         g_hResizeEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"100",
@@ -2108,14 +2235,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 SW_SHOWNORMAL         // show state
             );
             web = false;
-        } 
-        else 
+        }
+        else
 
         if (g_inAnimeMode) {
             // USER CLICKED → EXIT ANIMATION MODE
             g_inAnimeMode = false;
 
-         
+
 
             // Force full repaint of the normal interface
             InvalidateRect(hWnd, nullptr, TRUE);  // TRUE = erase background (critical!)
@@ -2123,11 +2250,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
             break;
         }
-        
+
 
         if (x >= 35 &&  x<270 &&y >= 40 && y <= 64) {  g_inAnimeMode = true;    }
-         
-     
+
+
 
         // === MINIMIZE BUTTON CLICK ===
         if (x >= MINIMIZE_ICON_X && x <= MINIMIZE_ICON_X + MINIMIZE_ICON_SIZE &&
@@ -2166,7 +2293,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             handled = true;
         }
 
-        
+
 
         // === GPU TOGGLE FIRST (so it wins!) ===
         else if (g_converter && g_converter->isGpuAvailable() &&
@@ -2188,7 +2315,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 y >= CHK_RESIZE_Y && y <= CHK_RESIZE_Y + CHK_SIZE) {
                 g_state.doResize = !g_state.doResize;
                 if (g_state.doResize && g_state.resizePercent == 100) {
-                    g_state.resizePercent = 100;  
+                    g_state.resizePercent = 100;
                     g_state.resizeInput = L"100";
                 }
                 InvalidateRect(hWnd, NULL, FALSE);
@@ -2207,6 +2334,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             else if (x >= CHK_DENOISE_X && x <= CHK_DENOISE_X + CHK_SIZE &&
                 y >= CHK_DENOISE_Y && y <= CHK_DENOISE_Y + CHK_SIZE) {
                 g_state.doDenoise = !g_state.doDenoise;
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+
+            // Upscale checkbox
+            else if (x >= CHK_UPSCALE_X && x <= CHK_UPSCALE_X + CHK_SIZE &&
+                y >= CHK_UPSCALE_Y && y <= CHK_UPSCALE_Y + CHK_SIZE) {
+                g_state.doUpscale = !g_state.doUpscale;
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+
+            // Upscale label click to cycle factor
+            else if (x >= CHK_UPSCALE_X + CHK_SIZE && x <= CHK_UPSCALE_X + 200 &&
+                     y >= CHK_UPSCALE_Y && y <= CHK_UPSCALE_Y + CHK_SIZE) {
+                if (g_state.upscaleFactor == 2) g_state.upscaleFactor = 3;
+                else if (g_state.upscaleFactor == 3) g_state.upscaleFactor = 4;
+                else g_state.upscaleFactor = 2;
                 InvalidateRect(hWnd, NULL, FALSE);
                 handled = true;
             }
@@ -2281,8 +2426,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
 
 
-        
-         
+
+
 
 
 
@@ -2299,13 +2444,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         int y = GET_Y_LPARAM(lParam);
 
 
-        
+
 
 
         if (x >= 820 && x < 880 && y >= 510 && y <= 532) web = true;
         else web = false;
-         
-        // Title hover  
+
+        // Title hover
         bool inTitle = (x >= 35 && x < 270 && y >= 40 && y <= 64);
 
         if (inTitle != g_hoverTitle) {
@@ -2472,7 +2617,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         FillRect(memDC, &rc, bgBrush);
         DeleteObject(bgBrush);
         SetBkMode(memDC, TRANSPARENT);
-        
+
 
         HFONT hTitle = CreateFontW(44, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FF_DONTCARE, L"Segoe UI");
         HFONT hSub = CreateFontW(ICON_SIZE, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FF_DONTCARE, L"Segoe UI");
@@ -2482,10 +2627,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
         if (g_inAnimeMode) { PlayGodTierAnimeEnding(hdc, hWnd);   break; }
 
-        
 
 
-       // == = WEB BUTTON with hover effect == = 
+
+       // == = WEB BUTTON with hover effect == =
         SetTextColor(memDC, RGB(33, 33,66));
         SetTextColor(memDC, web?  RGB((200+rand()%50), 222, (200 + rand() % 50)) : RGB(33, 33, 66));
         SelectObject(memDC, hSmall);
@@ -2494,8 +2639,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                         820 + 60,
                         505 + 22 };
         DrawTextW(memDC, L"www", -1, &rExit2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        
-        
+
+
 
 
         /// === RAINBOW SPINNING MINIMIZE BUTTON (GOD MODE) ===
@@ -2526,7 +2671,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
             // Optional: tiny glow circle behind it
             if (g_hoverMinimize) {
-                
+
                 DrawRoundedRect(memDC,
                     MINIMIZE_ICON_X - 2, MINIMIZE_ICON_Y -2,
                     MINIMIZE_ICON_SIZE + 6, MINIMIZE_ICON_SIZE + 6,
@@ -2535,9 +2680,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
         }
    /////////////////////
-         
 
-        
+
+
         // Folder icon hover effect
         SelectObject(memDC, hSub);
         SetTextColor(memDC,  RGB(200, 200, 255) );
@@ -2548,9 +2693,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             DrawRoundedRect(memDC,
                 FOLDER_ICON_X, ICON_MARGIN, ICON_SIZE,  ICON_SIZE,
                 10, RGB(200, 0, 0));
-            
+
         }
-        
+
         DrawTextW(memDC, L"📁", -1, &rFolder, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
 
@@ -2567,7 +2712,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         RECT rExit = { EXIT_ICON_X, ICON_MARGIN, EXIT_ICON_X + ICON_SIZE, ICON_MARGIN + ICON_SIZE };
         DrawTextW(memDC, L"✕", -1, &rExit, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-        
+
 
         // Title
         SetTextColor(memDC, g_hoverTitle ? RGB(1, 1, 1) : RGB(255, 255, 0));
@@ -2634,9 +2779,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             DrawTextW(memDC, formats[i], -1, &rBtn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
-        
+
         // === FOOTER - Output Folder (Clickable + Hover Effect) ===
-         
+
             // Footer g_output_folder
             SelectObject(memDC, hBold);
             SetTextColor(memDC, RGB(150, 180, 220));
@@ -2672,10 +2817,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 SelectObject(memDC, oldPen);
                 DeleteObject(pen);
             }
-         
-      
-        
-        
+
+
+
+
 
         // Right Settings Panel
         DrawRoundedRect(memDC, SETTINGS_PANEL_X, SETTINGS_PANEL_Y,
@@ -2775,6 +2920,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                                    CHK_DENOISE_X + 250, CHK_DENOISE_Y + CHK_SIZE + 12 };
             DrawTextW(memDC, L"Apply Denoising", -1, &rDenoiseLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
+            // 4. Upscale Checkbox
+            DrawRoundedRect(memDC, CHK_UPSCALE_X, CHK_UPSCALE_Y, CHK_SIZE, CHK_SIZE, 4,
+                g_state.doUpscale ? RGB(59, 130, 246) : RGB(30, 50, 90));
+            if (g_state.doUpscale) {
+                SetTextColor(memDC, RGB(255, 255, 255));
+                RECT rCheck = { CHK_UPSCALE_X, CHK_UPSCALE_Y, CHK_UPSCALE_X + CHK_SIZE, CHK_UPSCALE_Y + CHK_SIZE };
+                DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+
+            SetTextColor(memDC, RGB(200, 220, 255));
+            RECT rUpscaleLabel = { CHK_UPSCALE_X + CHK_SIZE + 10, CHK_UPSCALE_Y,
+                                   CHK_UPSCALE_X + 250, CHK_UPSCALE_Y + CHK_SIZE + 12 };
+            wchar_t upscaleStr[32];
+            swprintf_s(upscaleStr, L"Upscale %dx (EDSR)", g_state.upscaleFactor);
+            DrawTextW(memDC, upscaleStr, -1, &rUpscaleLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
 
             // Denoise slider (only show when denoise is checked)
             if (g_state.doDenoise) {
@@ -2805,8 +2966,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
         }
 
-   
-         
+
+
         // === GPU TOGGLE BUTTON - FINAL PERFECT VERSION ===
         bool gpuAvailable = g_converter && g_converter->isGpuAvailable();
         std::wstring gpuText = gpuAvailable
@@ -2833,7 +2994,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         ////////////////////////////////////////////
 
 
-         
+
 
          // Drop zone
         HPEN hPen = CreatePen(PS_DASH, 2, RGB(100, 150, 220));
@@ -2850,7 +3011,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         DrawTextW(memDC, L"Drop Images or Folders Here", -1, &rDrop, DT_CENTER | DT_SINGLELINE);
 
 
- 
+
 
 
 
@@ -2967,8 +3128,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             RECT rDots = { barX, barY + barH + 38, barX + barW, barY + barH + 62 };
             DrawTextW(memDC, fire.c_str(), -1, &rDots, DT_CENTER | DT_SINGLELINE);
         }
-               
-        
+
+
 
         ///////////////////////////////////////////////////////
 
@@ -2984,7 +3145,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
 
 
-          
+
         // === RESULT OVERLAY — FINAL BEAUTIFUL CENTERED VERSION ===
         if (g_showResult) {
             if ((clock() - g_resultTime) > RESULT_DURATION) {
@@ -3016,7 +3177,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 // === Image count ===
                 SetTextColor(memDC, RGB(220, 240, 255));
                 wchar_t buf[64];
-                swprintf_s(buf, L"%zu images", 1+g_resultImageCount);
+                swprintf_s(buf, L"%zu images", g_resultImageCount);
                 RECT r1 = { panelX, panelY + 40, panelX + panelW, panelY + 60 };
                 DrawTextW(memDC, buf, -1, &r1, DT_CENTER | DT_SINGLELINE);
 
@@ -3040,7 +3201,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 RECT r4 = { panelX, panelY + 105, panelX + panelW, panelY + 135 };
                 DrawTextW(memDC, buf, -1, &r4, DT_CENTER | DT_SINGLELINE);
 
-                 
+
             }
         }
 ////////////////////////////////////////////////////////////////
@@ -3055,7 +3216,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
 
 
-         
+
 
 
 
@@ -3077,7 +3238,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_DESTROY:
-        
+
         PostQuitMessage(0);
         return 0;
     }
@@ -3165,24 +3326,23 @@ void EnableDarkMode() {
 
 void InitializePathsAndFolders()
 {
-    // Get full path to the running .exe (e.g. C:\Apps\QuickConvert.exe)
-    WCHAR exePath[MAX_PATH] = { 0 };
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-
-    // Remove the filename → leave only directory
-    PathRemoveFileSpecW(exePath);
-
-   
-    swprintf_s(g_outputFolder, MAX_PATH, L"%s\\Converted", exePath);
+    PWSTR pszPath = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &pszPath))) {
+        swprintf_s(g_outputFolder, MAX_PATH, L"%s\\QuickConvert", pszPath);
+        CoTaskMemFree(pszPath);
+    } else {
+        // Fallback to executable directory
+        WCHAR exePath[MAX_PATH] = { 0 };
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        PathRemoveFileSpecW(exePath);
+        swprintf_s(g_outputFolder, MAX_PATH, L"%s\\Converted", exePath);
+    }
 
     // Create the folder if it doesn't exist
     if (!PathIsDirectoryW(g_outputFolder))
     {
         CreateDirectoryW(g_outputFolder, nullptr);
     }
-
-    // Always ensure trailing backslash
-   // PathAddBackslashW(g_outputFolder);
 }
 
 
@@ -3273,7 +3433,7 @@ void PlayGodTierAnimeEnding(HDC hdc, HWND hWnd)
     SelectObject(memDC, hLink);
     TextOutW(memDC, WINDOW_WIDTH / 2 - 130, WINDOW_HEIGHT / 2 + 40, L"Freeware & Open Source • As-IS ", 31);
 
-   
+
 
     DeleteObject(hMed);
     DeleteObject(hLink);
@@ -3291,7 +3451,7 @@ void PlayGodTierAnimeEnding(HDC hdc, HWND hWnd)
 
         startTime = 0;
         g_inAnimeMode = false;
-        InvalidateRect(hWnd, nullptr, TRUE);  
+        InvalidateRect(hWnd, nullptr, TRUE);
         UpdateWindow(hWnd);
     }
 
@@ -3302,7 +3462,7 @@ void PlayGodTierAnimeEnding(HDC hdc, HWND hWnd)
 
     // Keep animating until mouse click
     InvalidateRect(hWnd, nullptr, FALSE);
-   
+
 }
 
 
