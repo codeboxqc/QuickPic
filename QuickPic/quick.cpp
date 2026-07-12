@@ -44,6 +44,7 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/dnn.hpp>
 #include <opencv2/dnn/dnn.hpp>
+#include <opencv2/dnn_superres.hpp>
 
 //////////////////////////
 #pragma warning(push)
@@ -196,8 +197,9 @@ struct AppState {
     bool doResize = false;
     bool doColorConvert = false;
     bool doDenoise = false;
-    bool doUpscale = false;
+    bool doUpscale = true;
     int upscaleFactor = 4;
+    int upscaleModelType = 0; // 0=FSRCNN, 1=LapSRN, 2=EDSR, 3=ESPCN
 
     int resizePercent = 100;
 
@@ -650,33 +652,27 @@ private:
                 try {
                     cv::Mat cpuTmp;
                     proc.download(cpuTmp);
-                    thread_local cv::dnn::Net sr_cuda_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
-                    thread_local cv::dnn::Net sr_cuda_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
-                    thread_local cv::dnn::Net sr_cuda_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
-                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_cuda_2 : ((state.upscaleFactor == 3) ? sr_cuda_3 : sr_cuda_4);
-                    if (!sr.empty()) {
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr;
+                    thread_local int currentScale = 0;
+                    thread_local int currentModel = -1;
+                    if (currentScale != state.upscaleFactor || currentModel != state.upscaleModelType) {
+                        std::string mName = (state.upscaleModelType == 0) ? "FSRCNN" :
+                                            (state.upscaleModelType == 1) ? "LapSRN" :
+                                            (state.upscaleModelType == 2) ? "EDSR" : "ESPCN";
+                        std::string mNameL = (state.upscaleModelType == 0) ? "fsrcnn" :
+                                             (state.upscaleModelType == 1) ? "lapsrn" :
+                                             (state.upscaleModelType == 2) ? "edsr" : "espcn";
+                        std::string modelName = mName + "_x" + std::to_string(state.upscaleFactor) + ".pb";
+                        sr.readModel(modelName);
+                        sr.setModel(mNameL, state.upscaleFactor);
                         sr.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
-                        sr.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
-
-                        cv::Mat blob = cv::dnn::blobFromImage(cpuTmp, 1.0, cv::Size(), cv::Scalar(), true, false);
-                        sr.setInput(blob);
-                        cv::Mat out = sr.forward();
-
-                        int channels = out.size[1];
-                        int rows = out.size[2];
-                        int cols = out.size[3];
-
-                        std::vector<cv::Mat> planes;
-                        for (int i = 0; i < channels; ++i) {
-                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
-                            planes.push_back(plane);
-                        }
-
-                        cv::Mat merged;
-                        cv::merge(planes, merged);
-                        merged.convertTo(cpuTmp, CV_8U);
+                        sr.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA_FP16);
+                        currentScale = state.upscaleFactor;
+                        currentModel = state.upscaleModelType;
                     }
-                    proc.upload(cpuTmp);
+                    cv::Mat out;
+                    sr.upsample(cpuTmp, out);
+                    proc.upload(out);
                 } catch (...) {
                     // Fallback
                 }
@@ -815,30 +811,25 @@ private:
                 try {
                     cv::Mat cpuTmp;
                     proc.copyTo(cpuTmp);
-                    thread_local cv::dnn::Net sr_ocl_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
-                    thread_local cv::dnn::Net sr_ocl_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
-                    thread_local cv::dnn::Net sr_ocl_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
-                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_ocl_2 : ((state.upscaleFactor == 3) ? sr_ocl_3 : sr_ocl_4);
-                    if (!sr.empty()) {
-                        cv::Mat blob = cv::dnn::blobFromImage(cpuTmp, 1.0, cv::Size(), cv::Scalar(), true, false);
-                        sr.setInput(blob);
-                        cv::Mat out = sr.forward();
-
-                        int channels = out.size[1];
-                        int rows = out.size[2];
-                        int cols = out.size[3];
-
-                        std::vector<cv::Mat> planes;
-                        for (int i = 0; i < channels; ++i) {
-                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
-                            planes.push_back(plane);
-                        }
-
-                        cv::Mat merged;
-                        cv::merge(planes, merged);
-                        merged.convertTo(cpuTmp, CV_8U);
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr;
+                    thread_local int currentScale = 0;
+                    thread_local int currentModel = -1;
+                    if (currentScale != state.upscaleFactor || currentModel != state.upscaleModelType) {
+                        std::string mName = (state.upscaleModelType == 0) ? "FSRCNN" :
+                                            (state.upscaleModelType == 1) ? "LapSRN" :
+                                            (state.upscaleModelType == 2) ? "EDSR" : "ESPCN";
+                        std::string mNameL = (state.upscaleModelType == 0) ? "fsrcnn" :
+                                             (state.upscaleModelType == 1) ? "lapsrn" :
+                                             (state.upscaleModelType == 2) ? "edsr" : "espcn";
+                        std::string modelName = mName + "_x" + std::to_string(state.upscaleFactor) + ".pb";
+                        sr.readModel(modelName);
+                        sr.setModel(mNameL, state.upscaleFactor);
+                        currentScale = state.upscaleFactor;
+                        currentModel = state.upscaleModelType;
                     }
-                    cpuTmp.copyTo(proc);
+                    cv::Mat out;
+                    sr.upsample(cpuTmp, out);
+                    out.copyTo(proc);
                 } catch (...) {
                     // Fallback
                 }
@@ -2349,9 +2340,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // Upscale label click to cycle factor
             else if (x >= CHK_UPSCALE_X + CHK_SIZE && x <= CHK_UPSCALE_X + 200 &&
                      y >= CHK_UPSCALE_Y && y <= CHK_UPSCALE_Y + CHK_SIZE) {
-                if (g_state.upscaleFactor == 2) g_state.upscaleFactor = 3;
-                else if (g_state.upscaleFactor == 3) g_state.upscaleFactor = 4;
-                else g_state.upscaleFactor = 2;
+                // Click right side to cycle scale
+                if (x >= CHK_UPSCALE_X + 120) {
+                    if (g_state.upscaleFactor == 2) g_state.upscaleFactor = 3;
+                    else if (g_state.upscaleFactor == 3) g_state.upscaleFactor = 4;
+                    else g_state.upscaleFactor = 2;
+                } else { // Click left side to cycle model
+                    g_state.upscaleModelType = (g_state.upscaleModelType + 1) % 4;
+                }
                 InvalidateRect(hWnd, NULL, FALSE);
                 handled = true;
             }
@@ -2932,8 +2928,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             SetTextColor(memDC, RGB(200, 220, 255));
             RECT rUpscaleLabel = { CHK_UPSCALE_X + CHK_SIZE + 10, CHK_UPSCALE_Y,
                                    CHK_UPSCALE_X + 250, CHK_UPSCALE_Y + CHK_SIZE + 12 };
-            wchar_t upscaleStr[32];
-            swprintf_s(upscaleStr, L"Upscale %dx (EDSR)", g_state.upscaleFactor);
+            wchar_t upscaleStr[64];
+            const wchar_t* mName = (g_state.upscaleModelType == 0) ? L"FSRCNN" :
+                                   (g_state.upscaleModelType == 1) ? L"LapSRN" :
+                                   (g_state.upscaleModelType == 2) ? L"EDSR" : L"ESPCN";
+            swprintf_s(upscaleStr, L"Upscale %dx (%s)", g_state.upscaleFactor, mName);
             DrawTextW(memDC, upscaleStr, -1, &rUpscaleLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
 
