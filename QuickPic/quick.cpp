@@ -44,6 +44,7 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/dnn.hpp>
 #include <opencv2/dnn/dnn.hpp>
+#include <opencv2/dnn_superres.hpp>
 
 //////////////////////////
 #pragma warning(push)
@@ -532,32 +533,28 @@ private:
 
             if (state.doUpscale) {
                 try {
-                    cv::Mat cpuTmp;
-                    proc.copyTo(cpuTmp);
-                    thread_local cv::dnn::Net sr_ocl_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
-                    thread_local cv::dnn::Net sr_ocl_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
-                    thread_local cv::dnn::Net sr_ocl_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
-                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_ocl_2 : ((state.upscaleFactor == 3) ? sr_ocl_3 : sr_ocl_4);
-                    if (!sr.empty()) {
-                        cv::Mat blob = cv::dnn::blobFromImage(proc, 1.0, cv::Size(), cv::Scalar(), true, false);
-                        sr.setInput(blob);
-                        cv::Mat out = sr.forward();
-                        
-                        int channels = out.size[1];
-                        int rows = out.size[2];
-                        int cols = out.size[3];
-                        
-                        std::vector<cv::Mat> planes;
-                        for (int i = 0; i < channels; ++i) {
-                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
-                            planes.push_back(plane);
-                        }
-                        
-                        cv::Mat merged;
-                        cv::merge(planes, merged);
-                        merged.convertTo(cpuTmp, CV_8U);
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr_ocl_2;
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr_ocl_3;
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr_ocl_4;
+                    thread_local bool sr_ocl_2_loaded = false;
+                    thread_local bool sr_ocl_3_loaded = false;
+                    thread_local bool sr_ocl_4_loaded = false;
+
+                    cv::dnn_superres::DnnSuperResImpl* sr = nullptr;
+                    if (state.upscaleFactor == 2) {
+                        if (!sr_ocl_2_loaded) { sr_ocl_2.readModel("EDSR_x2.pb"); sr_ocl_2.setModel("edsr", 2); sr_ocl_2_loaded = true; }
+                        sr = &sr_ocl_2;
+                    } else if (state.upscaleFactor == 3) {
+                        if (!sr_ocl_3_loaded) { sr_ocl_3.readModel("EDSR_x3.pb"); sr_ocl_3.setModel("edsr", 3); sr_ocl_3_loaded = true; }
+                        sr = &sr_ocl_3;
+                    } else if (state.upscaleFactor == 4) {
+                        if (!sr_ocl_4_loaded) { sr_ocl_4.readModel("EDSR_x4.pb"); sr_ocl_4.setModel("edsr", 4); sr_ocl_4_loaded = true; }
+                        sr = &sr_ocl_4;
                     }
-                    cpuTmp.copyTo(proc);
+
+                    if (sr) {
+                        sr->upsample(proc, proc);
+                    }
                 } catch (...) {
                     // Fallback
                 }
@@ -650,31 +647,27 @@ private:
                 try {
                     cv::Mat cpuTmp;
                     proc.download(cpuTmp);
-                    thread_local cv::dnn::Net sr_cuda_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
-                    thread_local cv::dnn::Net sr_cuda_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
-                    thread_local cv::dnn::Net sr_cuda_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
-                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_cuda_2 : ((state.upscaleFactor == 3) ? sr_cuda_3 : sr_cuda_4);
-                    if (!sr.empty()) {
-                        sr.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
-                        sr.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
-                        
-                        cv::Mat blob = cv::dnn::blobFromImage(cpuTmp, 1.0, cv::Size(), cv::Scalar(), true, false);
-                        sr.setInput(blob);
-                        cv::Mat out = sr.forward();
-                        
-                        int channels = out.size[1];
-                        int rows = out.size[2];
-                        int cols = out.size[3];
-                        
-                        std::vector<cv::Mat> planes;
-                        for (int i = 0; i < channels; ++i) {
-                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
-                            planes.push_back(plane);
-                        }
-                        
-                        cv::Mat merged;
-                        cv::merge(planes, merged);
-                        merged.convertTo(cpuTmp, CV_8U);
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr_cuda_2;
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr_cuda_3;
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr_cuda_4;
+                    thread_local bool sr_cuda_2_loaded = false;
+                    thread_local bool sr_cuda_3_loaded = false;
+                    thread_local bool sr_cuda_4_loaded = false;
+
+                    cv::dnn_superres::DnnSuperResImpl* sr = nullptr;
+                    if (state.upscaleFactor == 2) {
+                        if (!sr_cuda_2_loaded) { sr_cuda_2.readModel("EDSR_x2.pb"); sr_cuda_2.setModel("edsr", 2); sr_cuda_2.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA); sr_cuda_2.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA_FP16); sr_cuda_2_loaded = true; }
+                        sr = &sr_cuda_2;
+                    } else if (state.upscaleFactor == 3) {
+                        if (!sr_cuda_3_loaded) { sr_cuda_3.readModel("EDSR_x3.pb"); sr_cuda_3.setModel("edsr", 3); sr_cuda_3.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA); sr_cuda_3.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA_FP16); sr_cuda_3_loaded = true; }
+                        sr = &sr_cuda_3;
+                    } else if (state.upscaleFactor == 4) {
+                        if (!sr_cuda_4_loaded) { sr_cuda_4.readModel("EDSR_x4.pb"); sr_cuda_4.setModel("edsr", 4); sr_cuda_4.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA); sr_cuda_4.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA_FP16); sr_cuda_4_loaded = true; }
+                        sr = &sr_cuda_4;
+                    }
+
+                    if (sr) {
+                        sr->upsample(cpuTmp, cpuTmp);
                     }
                     proc.upload(cpuTmp);
                 } catch (...) {
@@ -815,28 +808,27 @@ private:
                 try {
                     cv::Mat cpuTmp;
                     proc.copyTo(cpuTmp);
-                    thread_local cv::dnn::Net sr_ocl_2 = cv::dnn::readNetFromTensorflow("EDSR_x2.pb");
-                    thread_local cv::dnn::Net sr_ocl_3 = cv::dnn::readNetFromTensorflow("EDSR_x3.pb");
-                    thread_local cv::dnn::Net sr_ocl_4 = cv::dnn::readNetFromTensorflow("EDSR_x4.pb");
-                    cv::dnn::Net& sr = (state.upscaleFactor == 2) ? sr_ocl_2 : ((state.upscaleFactor == 3) ? sr_ocl_3 : sr_ocl_4);
-                    if (!sr.empty()) {
-                        cv::Mat blob = cv::dnn::blobFromImage(cpuTmp, 1.0, cv::Size(), cv::Scalar(), true, false);
-                        sr.setInput(blob);
-                        cv::Mat out = sr.forward();
-                        
-                        int channels = out.size[1];
-                        int rows = out.size[2];
-                        int cols = out.size[3];
-                        
-                        std::vector<cv::Mat> planes;
-                        for (int i = 0; i < channels; ++i) {
-                            cv::Mat plane(rows, cols, CV_32F, out.ptr<float>(0, i));
-                            planes.push_back(plane);
-                        }
-                        
-                        cv::Mat merged;
-                        cv::merge(planes, merged);
-                        merged.convertTo(cpuTmp, CV_8U);
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr_ocl_2;
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr_ocl_3;
+                    thread_local cv::dnn_superres::DnnSuperResImpl sr_ocl_4;
+                    thread_local bool sr_ocl_2_loaded = false;
+                    thread_local bool sr_ocl_3_loaded = false;
+                    thread_local bool sr_ocl_4_loaded = false;
+
+                    cv::dnn_superres::DnnSuperResImpl* sr = nullptr;
+                    if (state.upscaleFactor == 2) {
+                        if (!sr_ocl_2_loaded) { sr_ocl_2.readModel("EDSR_x2.pb"); sr_ocl_2.setModel("edsr", 2); sr_ocl_2_loaded = true; }
+                        sr = &sr_ocl_2;
+                    } else if (state.upscaleFactor == 3) {
+                        if (!sr_ocl_3_loaded) { sr_ocl_3.readModel("EDSR_x3.pb"); sr_ocl_3.setModel("edsr", 3); sr_ocl_3_loaded = true; }
+                        sr = &sr_ocl_3;
+                    } else if (state.upscaleFactor == 4) {
+                        if (!sr_ocl_4_loaded) { sr_ocl_4.readModel("EDSR_x4.pb"); sr_ocl_4.setModel("edsr", 4); sr_ocl_4_loaded = true; }
+                        sr = &sr_ocl_4;
+                    }
+
+                    if (sr) {
+                        sr->upsample(cpuTmp, cpuTmp);
                     }
                     cpuTmp.copyTo(proc);
                 } catch (...) {
@@ -2645,7 +2637,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
         /// === RAINBOW SPINNING MINIMIZE BUTTON (GOD MODE) ===
         {
-            const wchar_t* frames[] = { L"/", L"−", L"\\", L"|" };
+            const wchar_t* frames[] = { L"/", L"-", L"\\", L"|" };
             const wchar_t* icon = frames[g_minimizeAnimFrame];
 
             // Rainbow color — changes every frame!
@@ -2696,7 +2688,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             
         }
         
-        DrawTextW(memDC, L"📁", -1, &rFolder, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(memDC, L"...", -1, &rFolder, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
 
         // === CLOSE BUTTON with hover effect ===
@@ -2710,7 +2702,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 10, RGB(200, 0, 0));
         }
         RECT rExit = { EXIT_ICON_X, ICON_MARGIN, EXIT_ICON_X + ICON_SIZE, ICON_MARGIN + ICON_SIZE };
-        DrawTextW(memDC, L"✕", -1, &rExit, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(memDC, L"X", -1, &rExit, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
         
 
@@ -2719,7 +2711,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
        // SetTextColor(memDC, RGB(255, 255, 0));
         SelectObject(memDC, hTitle);
         RECT rTitle = { 30, 30, WINDOW_WIDTH, 80 };
-        DrawTextW(memDC, L"⚡", -1, &rTitle, DT_LEFT | DT_SINGLELINE);
+        DrawTextW(memDC, L">>", -1, &rTitle, DT_LEFT | DT_SINGLELINE);
         SetTextColor(memDC, g_hoverTitle ? RGB(255, 200, 100) : RGB(255, 255, 255));
        // SetTextColor(memDC, RGB(255, 255, 255));
         rTitle = { 38 + ICON_SIZE, 30, WINDOW_WIDTH, 80 };
@@ -2729,10 +2721,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         SelectObject(memDC, hBold);
         SetTextColor(memDC, RGB(200, 220, 255));
         RECT rSub = { 30, 80, WINDOW_WIDTH, 110 };
-        std::wstring subtitle = L"High-Quality • ";
+        std::wstring subtitle = L"High-Quality - ";
         if (g_converter && g_converter->isGpuAvailable()) {
             std::string backend = getAvailableGpuBackend();
-            if (!backend.empty()) subtitle += std::wstring(backend.begin(), backend.end()) + L" • ";
+            if (!backend.empty()) subtitle += std::wstring(backend.begin(), backend.end()) + L" - ";
         }
         subtitle += L"Batch Processing";
         DrawTextW(memDC, subtitle.c_str(), -1, &rSub, DT_LEFT | DT_SINGLELINE);
@@ -2844,7 +2836,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         if (g_state.doResize) {
             SetTextColor(memDC, RGB(255, 255, 255));
             RECT rCheck = { CHK_RESIZE_X, CHK_RESIZE_Y, CHK_RESIZE_X + CHK_SIZE, CHK_RESIZE_Y + CHK_SIZE };
-            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(memDC, L"v", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         SetTextColor(memDC, RGB(200, 220, 255));
         RECT rResizeLabel = { CHK_RESIZE_X + CHK_SIZE + 10, CHK_RESIZE_Y,
@@ -2880,7 +2872,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         if (g_state.doColorConvert) {
             SetTextColor(memDC, RGB(255, 255, 255));
             RECT rCheck = { CHK_COLOR_X, CHK_COLOR_Y, CHK_COLOR_X + CHK_SIZE, CHK_COLOR_Y + CHK_SIZE };
-            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(memDC, L"v", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         SetTextColor(memDC, RGB(200, 220, 255));
         RECT rColorLabel = { CHK_COLOR_X + CHK_SIZE + 10, CHK_COLOR_Y,
@@ -2912,7 +2904,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             if (g_state.doDenoise) {
                 SetTextColor(memDC, RGB(255, 255, 255));
                 RECT rCheck = { CHK_DENOISE_X, CHK_DENOISE_Y, CHK_DENOISE_X + CHK_SIZE, CHK_DENOISE_Y + CHK_SIZE };
-                DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawTextW(memDC, L"v", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
 
             SetTextColor(memDC, RGB(200, 220, 255));
@@ -2926,7 +2918,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             if (g_state.doUpscale) {
                 SetTextColor(memDC, RGB(255, 255, 255));
                 RECT rCheck = { CHK_UPSCALE_X, CHK_UPSCALE_Y, CHK_UPSCALE_X + CHK_SIZE, CHK_UPSCALE_Y + CHK_SIZE };
-                DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawTextW(memDC, L"v", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
 
             SetTextColor(memDC, RGB(200, 220, 255));
@@ -3123,7 +3115,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // Animated fire dots
             int dots = ((clock() - g_progressAnimTime) / 220) % 5;
             std::wstring fire = L"";
-            for (int i = 0; i < dots; ++i) fire += (i & 1) ? L"●" : L"○";
+            for (int i = 0; i < dots; ++i) fire += (i & 1) ? L"O" : L"o";
             SetTextColor(memDC, RGB(255, 100, 50));
             RECT rDots = { barX, barY + barH + 38, barX + barW, barY + barH + 62 };
             DrawTextW(memDC, fire.c_str(), -1, &rDots, DT_CENTER | DT_SINGLELINE);
@@ -3197,7 +3189,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 SelectObject(memDC, hSmall);
                 SetTextColor(memDC, RGB(140, 200, 255));
                 double speed = g_resultDuration > 0 ? (g_resultImageCount / g_resultDuration) : 0.0;
-                swprintf_s(buf, L"GPU: %s • %.1f img/s", g_resultGpuUsed ? L"Yes" : L"No", speed);
+                swprintf_s(buf, L"GPU: %s - %.1f img/s", g_resultGpuUsed ? L"Yes" : L"No", speed);
                 RECT r4 = { panelX, panelY + 105, panelX + panelW, panelY + 135 };
                 DrawTextW(memDC, buf, -1, &r4, DT_CENTER | DT_SINGLELINE);
 
@@ -3431,7 +3423,7 @@ void PlayGodTierAnimeEnding(HDC hdc, HWND hWnd)
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     SelectObject(memDC, hLink);
-    TextOutW(memDC, WINDOW_WIDTH / 2 - 130, WINDOW_HEIGHT / 2 + 40, L"Freeware & Open Source • As-IS ", 31);
+    TextOutW(memDC, WINDOW_WIDTH / 2 - 130, WINDOW_HEIGHT / 2 + 40, L"Freeware & Open Source - As-IS ", 31);
 
    
 
