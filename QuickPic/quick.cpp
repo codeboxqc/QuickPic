@@ -647,11 +647,14 @@ SuperResUpscaler::Backend PickSuperResBackend(bool preferGpu) {
 #endif
 }
 
+std::mutex g_upscaleMutex;
+
 // Single entry point used by every pipeline: tries the preferred backend with tiling
 // (so normal-sized images never OOM in the first place), and if that still fails for
 // any reason (e.g. GPU genuinely out of memory from other apps), automatically retries
 // once on CPU before giving up. Mutates `proc` in place on success.
 bool TryUpscale(cv::Mat& proc, int scale, bool preferGpu, const std::string& pipelineTag) {
+    std::lock_guard<std::mutex> lock(g_upscaleMutex);
     UpscaleLog(pipelineTag + ": attempting upscale, factor=" + std::to_string(scale) +
         ", input=" + std::to_string(proc.cols) + "x" + std::to_string(proc.rows));
 
