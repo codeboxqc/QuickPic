@@ -2984,7 +2984,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         if (g_state.doAutoWB) {
             SetTextColor(memDC, RGB(255, 255, 255));
             RECT rCheck = { CHK_AUTOWB_X, CHK_AUTOWB_Y, CHK_AUTOWB_X + CHK_SIZE, CHK_AUTOWB_Y + CHK_SIZE };
-            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(memDC, L"\x2713", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         SetTextColor(memDC, RGB(200, 220, 255));
         RECT rAutoWBLabel = { CHK_AUTOWB_X + CHK_SIZE + 10, CHK_AUTOWB_Y,
@@ -2997,7 +2997,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         if (g_state.doBgRemoval) {
             SetTextColor(memDC, RGB(255, 255, 255));
             RECT rCheck = { CHK_BG_X, CHK_BG_Y, CHK_BG_X + CHK_SIZE, CHK_BG_Y + CHK_SIZE };
-            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(memDC, L"\x2713", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         SetTextColor(memDC, RGB(200, 220, 255));
         RECT rBgLabel = { CHK_BG_X + CHK_SIZE + 10, CHK_BG_Y,
@@ -3010,7 +3010,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         if (g_state.doSeamCarving) {
             SetTextColor(memDC, RGB(255, 255, 255));
             RECT rCheck = { CHK_SEAM_X, CHK_SEAM_Y, CHK_SEAM_X + CHK_SIZE, CHK_SEAM_Y + CHK_SIZE };
-            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(memDC, L"\x2713", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         SetTextColor(memDC, RGB(200, 220, 255));
         RECT rSeamLabel = { CHK_SEAM_X + CHK_SIZE + 10, CHK_SEAM_Y,
@@ -3023,12 +3023,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         if (g_state.doRealESRGAN) {
             SetTextColor(memDC, RGB(255, 255, 255));
             RECT rCheck = { CHK_ESRGAN_X, CHK_ESRGAN_Y, CHK_ESRGAN_X + CHK_SIZE, CHK_ESRGAN_Y + CHK_SIZE };
-            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(memDC, L"\x2713", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         SetTextColor(memDC, RGB(200, 220, 255));
         RECT rESRGANLabel = { CHK_ESRGAN_X + CHK_SIZE + 10, CHK_ESRGAN_Y,
                               CHK_ESRGAN_X + 250, CHK_ESRGAN_Y + CHK_SIZE };
         DrawTextW(memDC, L"Real-ESRGAN Anime", -1, &rESRGANLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
 
         if (!g_state.doColorConvert) {
             // 3. Denoise Checkbox
