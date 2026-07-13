@@ -33,7 +33,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/core/ocl.hpp>
-#include <opencv2/imgcodecs/legacy/constants_c.h> 
+#include <opencv2/imgcodecs/legacy/constants_c.h>
 
 // CUDA-specific headers (if available in your OpenCV build)
 #include <opencv2/cudawarping.hpp>
@@ -149,7 +149,7 @@ bool g_hoverOutputFolder = false;  // Add this with your other hover vars
 constexpr int MINIMIZE_ICON_X = 7;
 constexpr int MINIMIZE_ICON_Y = 7;
 constexpr int MINIMIZE_ICON_SIZE = 36;
-bool g_hoverMinimize = false;  // Add with your other ho 
+bool g_hoverMinimize = false;  // Add with your other ho
 HICON g_hAppIcon = nullptr;
 
 clock_t g_minimizeAnimTime = 0;
@@ -209,7 +209,8 @@ struct AppState {
     bool doSeamCarving = false;
     bool doRealESRGAN = false;
 
-    int resizePercent = 100;
+    int resizeWidth = 1024;
+    int resizeHeight = 768;
 
     // Color conversion options
     enum ColorMode {
@@ -225,8 +226,10 @@ struct AppState {
     int denoiseTemplateWindowSize = 7;
     int denoiseSearchWindowSize = 21;
 
-    std::wstring resizeInput = L"100";
-    bool resizeInputActive = false;
+    std::wstring resizeInputX = L"1024";
+    std::wstring resizeInputY = L"768";
+    bool resizeInputXActive = false;
+    bool resizeInputYActive = false;
 };
 
 AppState g_state;
@@ -692,7 +695,7 @@ bool TryUpscale(cv::Mat& proc, int scale, bool preferGpu, const std::string& pip
 }
 
 /////////////////////////////////////////////////////////////////////////////////
-// ThreadPool 
+// ThreadPool
 ////////////////////////////////////////////////////////////////////////////////
 class ThreadPool {
 private:
@@ -916,9 +919,8 @@ private:
             // CPU pipeline
             cv::Mat proc = image;
 
-            if (state.doResize && state.resizePercent != 100) {
-                double scale = state.resizePercent / 100.0;
-                cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+            if (state.doResize) {
+                cv::Size s(state.resizeWidth, state.resizeHeight);
                 if (s.width > 0 && s.height > 0) cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
             }
 
@@ -996,9 +998,8 @@ private:
             cv::cuda::GpuMat proc = gpuMat;
 
             // Resize
-            if (state.doResize && state.resizePercent != 100) {
-                double scale = state.resizePercent / 100.0;
-                cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+            if (state.doResize) {
+                cv::Size s(state.resizeWidth, state.resizeHeight);
                 if (s.width > 0 && s.height > 0) {
                     cv::cuda::GpuMat tmp;
                     cv::cuda::resize(proc, tmp, s, 0, 0, cv::INTER_LINEAR);
@@ -1137,9 +1138,8 @@ private:
 
             cv::UMat proc = u;
 
-            if (state.doResize && state.resizePercent != 100) {
-                double scale = state.resizePercent / 100.0;
-                cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+            if (state.doResize) {
+                cv::Size s(state.resizeWidth, state.resizeHeight);
                 if (s.width > 0 && s.height > 0) cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
             }
 
@@ -1443,9 +1443,8 @@ private:
                         cv::cuda::GpuMat gpuProc = gpuMat;
 
                         // Resize
-                        if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
-                            double scale = stateSnapshot.resizePercent / 100.0;
-                            cv::Size s((int)(gpuProc.cols * scale), (int)(gpuProc.rows * scale));
+                        if (stateSnapshot.doResize) {
+                            cv::Size s(stateSnapshot.resizeWidth, stateSnapshot.resizeHeight);
                             if (s.width > 0 && s.height > 0) {
                                 cv::cuda::GpuMat tmp;
                                 cv::cuda::resize(gpuProc, tmp, s, 0, 0, cv::INTER_LINEAR);
@@ -1525,9 +1524,8 @@ private:
                         proc.copyTo(uProc);
 
                         // Resize
-                        if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
-                            double scale = stateSnapshot.resizePercent / 100.0;
-                            cv::Size s((int)(uProc.cols * scale), (int)(uProc.rows * scale));
+                        if (stateSnapshot.doResize) {
+                            cv::Size s(stateSnapshot.resizeWidth, stateSnapshot.resizeHeight);
                             if (s.width > 0 && s.height > 0) {
                                 cv::resize(uProc, uProc, s, 0, 0, cv::INTER_LINEAR);
                             }
@@ -1562,9 +1560,8 @@ private:
             }
             else {
                 // === CPU PIPELINE (or denoising required) ===
-                if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
-                    double scale = stateSnapshot.resizePercent / 100.0;
-                    cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+                if (stateSnapshot.doResize) {
+                    cv::Size s(stateSnapshot.resizeWidth, stateSnapshot.resizeHeight);
                     if (s.width > 0 && s.height > 0) {
                         cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
                     }
@@ -1704,7 +1701,7 @@ std::string getAvailableGpuBackend() {
 /////////////////////////////////////////////////////////////////////////////////////
 //
 //  MAIN
-// 
+//
 ////////////////////////////////////////////////////////////////////////////////////
 
 ImageConverter* g_converter = nullptr;
@@ -2081,10 +2078,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     const int CHK_DENOISE_Y = CHK_COLOR_Y + 40;
 
     // Resize input field
-    const int RESIZE_INPUT_X = CHK_RESIZE_X + 120;
-    const int RESIZE_INPUT_Y = CHK_RESIZE_Y;
-    const int RESIZE_INPUT_W = 60;
+    const int RESIZE_INPUT_X_X = CHK_RESIZE_X + 100;
+    const int RESIZE_INPUT_X_Y = CHK_RESIZE_Y;
+    const int RESIZE_INPUT_X_W = 50;
     const int RESIZE_INPUT_H = 25;
+
+    const int RESIZE_INPUT_Y_X = RESIZE_INPUT_X_X + RESIZE_INPUT_X_W + 20; // +20 for "x" char
+    const int RESIZE_INPUT_Y_Y = CHK_RESIZE_Y;
+    const int RESIZE_INPUT_Y_W = 50;
 
     // Color mode selection (below color checkbox)
     const int COLOR_MODE_Y = CHK_COLOR_Y + 30;
@@ -2119,7 +2120,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     HFONT hFonto = NULL;
 
     // Static variables for controls
-    static HWND g_hResizeEdit = nullptr;
+    static HWND g_hResizeEditX = nullptr;
+    static HWND g_hResizeEditY = nullptr;
     static bool g_bIsDraggingDenoiseSlider = false;
     static bool g_hoverFolder = false;
     static bool g_hoverGpu = false;
@@ -2166,24 +2168,32 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
 
 
-        // Create edit control for resize input
-        g_hResizeEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"100",
+        // Create edit controls for resize input
+        g_hResizeEditX = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"1024",
             WS_CHILD | ES_NUMBER | ES_RIGHT,
-            RESIZE_INPUT_X, RESIZE_INPUT_Y, RESIZE_INPUT_W, RESIZE_INPUT_H,
+            RESIZE_INPUT_X_X, RESIZE_INPUT_X_Y, RESIZE_INPUT_X_W, RESIZE_INPUT_H,
             hWnd, (HMENU)1004, hInst, NULL);
 
-        // Limit to 3 digits (max 100%)
-        SendMessage(g_hResizeEdit, EM_SETLIMITTEXT, 3, 0);
+        g_hResizeEditY = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"768",
+            WS_CHILD | ES_NUMBER | ES_RIGHT,
+            RESIZE_INPUT_Y_X, RESIZE_INPUT_Y_Y, RESIZE_INPUT_Y_W, RESIZE_INPUT_H,
+            hWnd, (HMENU)1005, hInst, NULL);
+
+        // Limit to 5 digits (e.g. 10000)
+        SendMessage(g_hResizeEditX, EM_SETLIMITTEXT, 5, 0);
+        SendMessage(g_hResizeEditY, EM_SETLIMITTEXT, 5, 0);
 
         // Set font
         hFonto = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        SendMessage(g_hResizeEdit, WM_SETFONT, (WPARAM)hFonto, TRUE);
+        SendMessage(g_hResizeEditX, WM_SETFONT, (WPARAM)hFonto, TRUE);
+        SendMessage(g_hResizeEditY, WM_SETFONT, (WPARAM)hFonto, TRUE);
         DeleteObject(hFonto);
 
-        // Initially hide it
-        ShowWindow(g_hResizeEdit, SW_HIDE);
+        // Initially hide them
+        ShowWindow(g_hResizeEditX, SW_HIDE);
+        ShowWindow(g_hResizeEditY, SW_HIDE);
         return 0;
     }
 
@@ -2221,20 +2231,34 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         int id = LOWORD(wParam);
         int code = HIWORD(wParam);
 
-        if (id == 1004 && code == EN_KILLFOCUS) { // Edit control lost focus
+        if (id == 1004 && code == EN_KILLFOCUS) { // Edit control X lost focus
             wchar_t buffer[10];
-            GetWindowText(g_hResizeEdit, buffer, 10);
+            GetWindowText(g_hResizeEditX, buffer, 10);
 
-            int percent = _wtoi(buffer);
-            if (percent < 10) percent = 10;
-            if (percent > 100) percent = 100;
+            int width = _wtoi(buffer);
+            if (width < 1) width = 1;
 
-            g_state.resizePercent = percent;
-            swprintf_s(buffer, L"%d", percent);
-            g_state.resizeInput = buffer;
+            g_state.resizeWidth = width;
+            swprintf_s(buffer, L"%d", width);
+            g_state.resizeInputX = buffer;
 
-            g_state.resizeInputActive = false;
-            ShowWindow(g_hResizeEdit, SW_HIDE);
+            g_state.resizeInputXActive = false;
+            ShowWindow(g_hResizeEditX, SW_HIDE);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        else if (id == 1005 && code == EN_KILLFOCUS) { // Edit control Y lost focus
+            wchar_t buffer[10];
+            GetWindowText(g_hResizeEditY, buffer, 10);
+
+            int height = _wtoi(buffer);
+            if (height < 1) height = 1;
+
+            g_state.resizeHeight = height;
+            swprintf_s(buffer, L"%d", height);
+            g_state.resizeInputY = buffer;
+
+            g_state.resizeInputYActive = false;
+            ShowWindow(g_hResizeEditY, SW_HIDE);
             InvalidateRect(hWnd, NULL, FALSE);
         }
         return 0;
@@ -2335,10 +2359,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             if (x >= CHK_RESIZE_X && x <= CHK_RESIZE_X + CHK_SIZE &&
                 y >= CHK_RESIZE_Y && y <= CHK_RESIZE_Y + CHK_SIZE) {
                 g_state.doResize = !g_state.doResize;
-                if (g_state.doResize && g_state.resizePercent == 100) {
-                    g_state.resizePercent = 100;
-                    g_state.resizeInput = L"100";
-                }
                 InvalidateRect(hWnd, NULL, FALSE);
                 handled = true;
             }
@@ -2428,15 +2448,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
 
 
-            // Resize input field click
+            // Resize input X field click
             else if (g_state.doResize &&
-                x >= RESIZE_INPUT_X && x <= RESIZE_INPUT_X + RESIZE_INPUT_W &&
-                y >= RESIZE_INPUT_Y && y <= RESIZE_INPUT_Y + RESIZE_INPUT_H) {
-                g_state.resizeInputActive = true;
-                ShowWindow(g_hResizeEdit, SW_SHOW);
-                SetWindowText(g_hResizeEdit, g_state.resizeInput.c_str());
-                SetFocus(g_hResizeEdit);
-                SendMessage(g_hResizeEdit, EM_SETSEL, 0, -1);
+                x >= RESIZE_INPUT_X_X && x <= RESIZE_INPUT_X_X + RESIZE_INPUT_X_W &&
+                y >= RESIZE_INPUT_X_Y && y <= RESIZE_INPUT_X_Y + RESIZE_INPUT_H) {
+                g_state.resizeInputXActive = true;
+                ShowWindow(g_hResizeEditX, SW_SHOW);
+                SetWindowText(g_hResizeEditX, g_state.resizeInputX.c_str());
+                SetFocus(g_hResizeEditX);
+                SendMessage(g_hResizeEditX, EM_SETSEL, 0, -1);
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+            // Resize input Y field click
+            else if (g_state.doResize &&
+                x >= RESIZE_INPUT_Y_X && x <= RESIZE_INPUT_Y_X + RESIZE_INPUT_Y_W &&
+                y >= RESIZE_INPUT_Y_Y && y <= RESIZE_INPUT_Y_Y + RESIZE_INPUT_H) {
+                g_state.resizeInputYActive = true;
+                ShowWindow(g_hResizeEditY, SW_SHOW);
+                SetWindowText(g_hResizeEditY, g_state.resizeInputY.c_str());
+                SetFocus(g_hResizeEditY);
+                SendMessage(g_hResizeEditY, EM_SETSEL, 0, -1);
                 InvalidateRect(hWnd, NULL, FALSE);
                 handled = true;
             }
@@ -2491,9 +2523,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
 
         // Click outside resize input deactivates it
-        if (g_state.resizeInputActive && !handled) {
-            g_state.resizeInputActive = false;
-            ShowWindow(g_hResizeEdit, SW_HIDE);
+        if (g_state.resizeInputXActive && !handled) {
+            g_state.resizeInputXActive = false;
+            ShowWindow(g_hResizeEditX, SW_HIDE);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        if (g_state.resizeInputYActive && !handled) {
+            g_state.resizeInputYActive = false;
+            ShowWindow(g_hResizeEditY, SW_HIDE);
             InvalidateRect(hWnd, NULL, FALSE);
         }
 
@@ -2522,7 +2559,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         if (x >= 820 && x < 880 && y >= 510 && y <= 532) web = true;
         else web = false;
 
-        // Title hover  
+        // Title hover
         bool inTitle = (x >= 35 && x < 270 && y >= 40 && y <= 64);
 
         if (inTitle != g_hoverTitle) {
@@ -2631,32 +2668,54 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_CHAR: {
-        if (g_state.resizeInputActive && wParam >= '0' && wParam <= '9') {
-            // Only allow digits
-            if (g_state.resizeInput.length() < 3) { // Max 3 digits (100%)
-                g_state.resizeInput += static_cast<wchar_t>(wParam);
-                g_state.resizePercent = _wtoi(g_state.resizeInput.c_str());
+        if (g_state.resizeInputXActive && wParam >= '0' && wParam <= '9') {
+            if (g_state.resizeInputX.length() < 5) {
+                g_state.resizeInputX += static_cast<wchar_t>(wParam);
+                g_state.resizeWidth = _wtoi(g_state.resizeInputX.c_str());
                 InvalidateRect(hWnd, NULL, FALSE);
             }
         }
-        else if (g_state.resizeInputActive && wParam == VK_BACK) {
-            // Backspace
-            if (!g_state.resizeInput.empty()) {
-                g_state.resizeInput.pop_back();
-                if (g_state.resizeInput.empty()) {
-                    g_state.resizeInput = L"100";
-                    g_state.resizePercent = 100;
+        else if (g_state.resizeInputXActive && wParam == VK_BACK) {
+            if (!g_state.resizeInputX.empty()) {
+                g_state.resizeInputX.pop_back();
+                if (g_state.resizeInputX.empty()) {
+                    g_state.resizeInputX = L"1";
+                    g_state.resizeWidth = 1;
                 }
                 else {
-                    g_state.resizePercent = _wtoi(g_state.resizeInput.c_str());
+                    g_state.resizeWidth = _wtoi(g_state.resizeInputX.c_str());
                 }
                 InvalidateRect(hWnd, NULL, FALSE);
             }
         }
-        else if (g_state.resizeInputActive && wParam == VK_RETURN) {
-            // Enter to finish
-            g_state.resizeInputActive = false;
-            ShowWindow(g_hResizeEdit, SW_HIDE);
+        else if (g_state.resizeInputXActive && wParam == VK_RETURN) {
+            g_state.resizeInputXActive = false;
+            ShowWindow(g_hResizeEditX, SW_HIDE);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        else if (g_state.resizeInputYActive && wParam >= '0' && wParam <= '9') {
+            if (g_state.resizeInputY.length() < 5) {
+                g_state.resizeInputY += static_cast<wchar_t>(wParam);
+                g_state.resizeHeight = _wtoi(g_state.resizeInputY.c_str());
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+        }
+        else if (g_state.resizeInputYActive && wParam == VK_BACK) {
+            if (!g_state.resizeInputY.empty()) {
+                g_state.resizeInputY.pop_back();
+                if (g_state.resizeInputY.empty()) {
+                    g_state.resizeInputY = L"1";
+                    g_state.resizeHeight = 1;
+                }
+                else {
+                    g_state.resizeHeight = _wtoi(g_state.resizeInputY.c_str());
+                }
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+        }
+        else if (g_state.resizeInputYActive && wParam == VK_RETURN) {
+            g_state.resizeInputYActive = false;
+            ShowWindow(g_hResizeEditY, SW_HIDE);
             InvalidateRect(hWnd, NULL, FALSE);
         }
         return 0;
@@ -2665,9 +2724,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     case WM_KEYDOWN: {
         if (wParam == VK_ESCAPE) {
             // If in resize input mode, exit it first
-            if (g_state.resizeInputActive) {
-                g_state.resizeInputActive = false;
-                ShowWindow(g_hResizeEdit, SW_HIDE);
+            if (g_state.resizeInputXActive) {
+                g_state.resizeInputXActive = false;
+                ShowWindow(g_hResizeEditX, SW_HIDE);
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            else if (g_state.resizeInputYActive) {
+                g_state.resizeInputYActive = false;
+                ShowWindow(g_hResizeEditY, SW_HIDE);
                 InvalidateRect(hWnd, NULL, FALSE);
             }
             else {
@@ -2702,7 +2766,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
 
 
-        // == = WEB BUTTON with hover effect == = 
+        // == = WEB BUTTON with hover effect == =
         SetTextColor(memDC, RGB(33, 33, 66));
         SetTextColor(memDC, web ? RGB((200 + rand() % 50), 222, (200 + rand() % 50)) : RGB(33, 33, 66));
         SelectObject(memDC, hSmall);
@@ -2923,27 +2987,43 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                               CHK_RESIZE_X + 200, CHK_RESIZE_Y + CHK_SIZE };
         DrawTextW(memDC, L"Resize", -1, &rResizeLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        // Resize percentage input (only show when resize is checked)
+        // Resize width/height inputs (only show when resize is checked)
         if (g_state.doResize) {
-            // Only draw static text if not editing
-            if (!g_state.resizeInputActive) {
-                DrawRoundedRect(memDC, RESIZE_INPUT_X, RESIZE_INPUT_Y,
-                    RESIZE_INPUT_W, RESIZE_INPUT_H, 4, RGB(40, 60, 100));
+            // X Input (Width)
+            if (!g_state.resizeInputXActive) {
+                DrawRoundedRect(memDC, RESIZE_INPUT_X_X, RESIZE_INPUT_X_Y,
+                    RESIZE_INPUT_X_W, RESIZE_INPUT_H, 4, RGB(40, 60, 100));
 
                 SetTextColor(memDC, RGB(255, 255, 255));
-                RECT rResizeInput = { RESIZE_INPUT_X + 5, RESIZE_INPUT_Y,
-                                      RESIZE_INPUT_X + RESIZE_INPUT_W - 5, RESIZE_INPUT_Y + RESIZE_INPUT_H };
+                RECT rResizeInputX = { RESIZE_INPUT_X_X + 5, RESIZE_INPUT_X_Y,
+                                      RESIZE_INPUT_X_X + RESIZE_INPUT_X_W - 5, RESIZE_INPUT_X_Y + RESIZE_INPUT_H };
 
-                wchar_t resizeText[10];
-                swprintf_s(resizeText, L"%d", g_state.resizePercent);
-                DrawTextW(memDC, resizeText, -1, &rResizeInput,
+                wchar_t resizeTextX[10];
+                swprintf_s(resizeTextX, L"%d", g_state.resizeWidth);
+                DrawTextW(memDC, resizeTextX, -1, &rResizeInputX,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             }
 
-            // Percent symbol
-            RECT rPercent = { RESIZE_INPUT_X + RESIZE_INPUT_W + 5, RESIZE_INPUT_Y,
-                              RESIZE_INPUT_X + RESIZE_INPUT_W + 30, RESIZE_INPUT_Y + RESIZE_INPUT_H };
-            DrawTextW(memDC, L"%", -1, &rPercent, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            // "x" separator
+            SetTextColor(memDC, RGB(200, 220, 255));
+            RECT rX = { RESIZE_INPUT_X_X + RESIZE_INPUT_X_W + 2, RESIZE_INPUT_X_Y,
+                        RESIZE_INPUT_Y_X - 2, RESIZE_INPUT_X_Y + RESIZE_INPUT_H };
+            DrawTextW(memDC, L"x", -1, &rX, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            // Y Input (Height)
+            if (!g_state.resizeInputYActive) {
+                DrawRoundedRect(memDC, RESIZE_INPUT_Y_X, RESIZE_INPUT_Y_Y,
+                    RESIZE_INPUT_Y_W, RESIZE_INPUT_H, 4, RGB(40, 60, 100));
+
+                SetTextColor(memDC, RGB(255, 255, 255));
+                RECT rResizeInputY = { RESIZE_INPUT_Y_X + 5, RESIZE_INPUT_Y_Y,
+                                      RESIZE_INPUT_Y_X + RESIZE_INPUT_Y_W - 5, RESIZE_INPUT_Y_Y + RESIZE_INPUT_H };
+
+                wchar_t resizeTextY[10];
+                swprintf_s(resizeTextY, L"%d", g_state.resizeHeight);
+                DrawTextW(memDC, resizeTextY, -1, &rResizeInputY,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            }
         }
 
         // 2. Color Convert Checkbox
@@ -3599,7 +3679,7 @@ void PlayGodTierAnimeEnding(HDC hdc, HWND hWnd)
         startTime = 0;
         g_inAnimeMode = false;
         InvalidateRect(hWnd, nullptr, TRUE);
-        UpdateWindow(hWnd);         
+        UpdateWindow(hWnd);
     }
 
     BitBlt(hdc, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, memDC, 0, 0, SRCCOPY);
