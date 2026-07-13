@@ -203,6 +203,12 @@ struct AppState {
     bool doUpscale = false;
     int  upscaleFactor = 2;   // 2, 3, or 4 (EDSR)
 
+    // New AI features
+    bool doAutoWB = false;
+    bool doBgRemoval = false;
+    bool doSeamCarving = false;
+    bool doRealESRGAN = false;
+
     int resizePercent = 100;
 
     // Color conversion options
@@ -1355,6 +1361,19 @@ private:
 
             AppState stateSnapshot = g_state;
 
+            if (stateSnapshot.doAutoWB) {
+                UpscaleLog("Pipeline: Auto White-Balance enabled for " + inputPathA);
+            }
+            if (stateSnapshot.doBgRemoval) {
+                UpscaleLog("Pipeline: Background Removal enabled for " + inputPathA);
+            }
+            if (stateSnapshot.doSeamCarving) {
+                UpscaleLog("Pipeline: Seam Carving enabled for " + inputPathA);
+            }
+            if (stateSnapshot.doRealESRGAN) {
+                UpscaleLog("Pipeline: Real-ESRGAN enabled for " + inputPathA);
+            }
+
 #ifdef _DEBUG
             std::wcout << L"Converting: " << inputPath << L" -> " << outputPath << std::endl;
 #endif
@@ -2084,6 +2103,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     const int SCALE_BTN_W = 50;
     const int SCALE_BTN_H = 26;
     const int SCALE_BTN_Y = CHK_UPSCALE_Y + 30;
+
+    // New AI features layout below Upscale buttons
+    const int CHK_AUTOWB_X = CHK_RESIZE_X;
+    const int CHK_AUTOWB_Y = SCALE_BTN_Y + 40;
+
+    const int CHK_BG_X = CHK_RESIZE_X;
+    const int CHK_BG_Y = CHK_AUTOWB_Y + 30;
+
+    const int CHK_SEAM_X = CHK_RESIZE_X;
+    const int CHK_SEAM_Y = CHK_BG_Y + 30;
+
+    const int CHK_ESRGAN_X = CHK_RESIZE_X;
+    const int CHK_ESRGAN_Y = CHK_SEAM_Y + 30;
     HFONT hFonto = NULL;
 
     // Static variables for controls
@@ -2354,6 +2386,47 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                     }
                 }
             }
+
+            // Auto WB checkbox
+            else if (x >= CHK_AUTOWB_X && x <= CHK_AUTOWB_X + CHK_SIZE &&
+                y >= CHK_AUTOWB_Y && y <= CHK_AUTOWB_Y + CHK_SIZE) {
+                g_state.doAutoWB = !g_state.doAutoWB;
+                UpscaleLog("UI: AutoWB checkbox clicked -> doAutoWB=" +
+                    std::string(g_state.doAutoWB ? "true" : "false"));
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+
+            // Background Removal checkbox
+            else if (x >= CHK_BG_X && x <= CHK_BG_X + CHK_SIZE &&
+                y >= CHK_BG_Y && y <= CHK_BG_Y + CHK_SIZE) {
+                g_state.doBgRemoval = !g_state.doBgRemoval;
+                UpscaleLog("UI: BgRemoval checkbox clicked -> doBgRemoval=" +
+                    std::string(g_state.doBgRemoval ? "true" : "false"));
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+
+            // Seam Carving checkbox
+            else if (x >= CHK_SEAM_X && x <= CHK_SEAM_X + CHK_SIZE &&
+                y >= CHK_SEAM_Y && y <= CHK_SEAM_Y + CHK_SIZE) {
+                g_state.doSeamCarving = !g_state.doSeamCarving;
+                UpscaleLog("UI: SeamCarving checkbox clicked -> doSeamCarving=" +
+                    std::string(g_state.doSeamCarving ? "true" : "false"));
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+
+            // Real-ESRGAN checkbox
+            else if (x >= CHK_ESRGAN_X && x <= CHK_ESRGAN_X + CHK_SIZE &&
+                y >= CHK_ESRGAN_Y && y <= CHK_ESRGAN_Y + CHK_SIZE) {
+                g_state.doRealESRGAN = !g_state.doRealESRGAN;
+                UpscaleLog("UI: RealESRGAN checkbox clicked -> doRealESRGAN=" +
+                    std::string(g_state.doRealESRGAN ? "true" : "false"));
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+
 
             // Resize input field click
             else if (g_state.doResize &&
@@ -2904,6 +2977,59 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
         }
 
+        // 5. Auto White Balance Checkbox
+        SelectObject(memDC, hSub);
+        DrawRoundedRect(memDC, CHK_AUTOWB_X, CHK_AUTOWB_Y, CHK_SIZE, CHK_SIZE, 4,
+            g_state.doAutoWB ? RGB(59, 130, 246) : RGB(30, 50, 90));
+        if (g_state.doAutoWB) {
+            SetTextColor(memDC, RGB(255, 255, 255));
+            RECT rCheck = { CHK_AUTOWB_X, CHK_AUTOWB_Y, CHK_AUTOWB_X + CHK_SIZE, CHK_AUTOWB_Y + CHK_SIZE };
+            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        SetTextColor(memDC, RGB(200, 220, 255));
+        RECT rAutoWBLabel = { CHK_AUTOWB_X + CHK_SIZE + 10, CHK_AUTOWB_Y,
+                              CHK_AUTOWB_X + 250, CHK_AUTOWB_Y + CHK_SIZE };
+        DrawTextW(memDC, L"Auto White Balance", -1, &rAutoWBLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        // 6. Background Removal Checkbox
+        DrawRoundedRect(memDC, CHK_BG_X, CHK_BG_Y, CHK_SIZE, CHK_SIZE, 4,
+            g_state.doBgRemoval ? RGB(59, 130, 246) : RGB(30, 50, 90));
+        if (g_state.doBgRemoval) {
+            SetTextColor(memDC, RGB(255, 255, 255));
+            RECT rCheck = { CHK_BG_X, CHK_BG_Y, CHK_BG_X + CHK_SIZE, CHK_BG_Y + CHK_SIZE };
+            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        SetTextColor(memDC, RGB(200, 220, 255));
+        RECT rBgLabel = { CHK_BG_X + CHK_SIZE + 10, CHK_BG_Y,
+                          CHK_BG_X + 250, CHK_BG_Y + CHK_SIZE };
+        DrawTextW(memDC, L"Background Removal", -1, &rBgLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        // 7. Seam Carving Checkbox
+        DrawRoundedRect(memDC, CHK_SEAM_X, CHK_SEAM_Y, CHK_SIZE, CHK_SIZE, 4,
+            g_state.doSeamCarving ? RGB(59, 130, 246) : RGB(30, 50, 90));
+        if (g_state.doSeamCarving) {
+            SetTextColor(memDC, RGB(255, 255, 255));
+            RECT rCheck = { CHK_SEAM_X, CHK_SEAM_Y, CHK_SEAM_X + CHK_SIZE, CHK_SEAM_Y + CHK_SIZE };
+            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        SetTextColor(memDC, RGB(200, 220, 255));
+        RECT rSeamLabel = { CHK_SEAM_X + CHK_SIZE + 10, CHK_SEAM_Y,
+                            CHK_SEAM_X + 250, CHK_SEAM_Y + CHK_SIZE };
+        DrawTextW(memDC, L"Seam Carving (Smart Crop)", -1, &rSeamLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        // 8. Real-ESRGAN Checkbox
+        DrawRoundedRect(memDC, CHK_ESRGAN_X, CHK_ESRGAN_Y, CHK_SIZE, CHK_SIZE, 4,
+            g_state.doRealESRGAN ? RGB(59, 130, 246) : RGB(30, 50, 90));
+        if (g_state.doRealESRGAN) {
+            SetTextColor(memDC, RGB(255, 255, 255));
+            RECT rCheck = { CHK_ESRGAN_X, CHK_ESRGAN_Y, CHK_ESRGAN_X + CHK_SIZE, CHK_ESRGAN_Y + CHK_SIZE };
+            DrawTextW(memDC, L"✓", -1, &rCheck, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        SetTextColor(memDC, RGB(200, 220, 255));
+        RECT rESRGANLabel = { CHK_ESRGAN_X + CHK_SIZE + 10, CHK_ESRGAN_Y,
+                              CHK_ESRGAN_X + 250, CHK_ESRGAN_Y + CHK_SIZE };
+        DrawTextW(memDC, L"Real-ESRGAN Anime", -1, &rESRGANLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
         if (!g_state.doColorConvert) {
             // 3. Denoise Checkbox
             DrawRoundedRect(memDC, CHK_DENOISE_X, CHK_DENOISE_Y, CHK_SIZE, CHK_SIZE, 4,
@@ -3193,7 +3319,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 // === Image count ===
                 SetTextColor(memDC, RGB(220, 240, 255));
                 wchar_t buf[64];
-                swprintf_s(buf, L"%zu images", 1 + g_resultImageCount);
+                swprintf_s(buf, L"%zu images", g_resultImageCount);
                 RECT r1 = { panelX, panelY + 40, panelX + panelW, panelY + 60 };
                 DrawTextW(memDC, buf, -1, &r1, DT_CENTER | DT_SINGLELINE);
 
