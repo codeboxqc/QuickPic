@@ -1,5 +1,5 @@
 [quickconvert_readme.md](https://github.com/user-attachments/files/23884969/quickconvert_readme.md)
-# ⚡ QuickConvert
+# ⚡ QuickConvert ai upscale 2x 3x and 4x esdr
 
 **High-performance batch image converter with GPU acceleration**
 
