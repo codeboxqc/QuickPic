@@ -145,6 +145,8 @@ clock_t RESULT_DURATION = 5000; // 5 seconds
 
 std::atomic<int> g_lastFailedCount = 0;
 bool g_hoverOutputFolder = false;  // Add this with your other hover vars
+bool g_hoverLog = false; // Hover effect for view log text
+std::wstring g_logFilePath; // Path to the debug log in temp folder
 
 
 constexpr int MINIMIZE_ICON_X = 7;
@@ -347,13 +349,10 @@ void UpscaleLog(const std::string& msg) {
     static bool initialized = false;
     if (!initialized) {
         initialized = true;
-        std::wstring logPath = g_outputFolder[0] != L'\0' ? std::wstring(g_outputFolder) : L".";
-        // Prefer the exe directory if we know it yet (g_exeDir set in InitializePathsAndFolders)
-        extern std::wstring g_exeDir;
-        if (!g_exeDir.empty()) logPath = g_exeDir;
-        if (!logPath.empty() && logPath.back() != L'\\') logPath += L'\\';
-        logPath += L"upscale_debug.log";
-        logFile.open(logPath, std::ios::out | std::ios::app);
+        // The log path is now initialized in InitializePathsAndFolders (in temp folder)
+        if (!g_logFilePath.empty()) {
+            logFile.open(g_logFilePath, std::ios::out | std::ios::app);
+        }
     }
     if (logFile.is_open()) {
         SYSTEMTIME st; GetLocalTime(&st);
@@ -2839,6 +2838,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             handled = true;
         }
 
+        // === CLICK VIEW LOG TEXT → Open Notepad ===
+        else if (g_hoverLog) {
+            if (!g_logFilePath.empty()) {
+                ShellExecuteW(nullptr, L"open", L"notepad.exe", g_logFilePath.c_str(), nullptr, SW_SHOWNORMAL);
+            }
+            handled = true;
+        }
+
         // Quality Slider Hit Test
         else if (x >= SLIDER_X - 10 && x <= SLIDER_X + SLIDER_W + 10 && y >= SLIDER_Y - 15 && y <= SLIDER_Y + 15) {
             g_state.isDraggingSlider = true;
@@ -3116,6 +3123,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             InvalidateRect(hWnd, NULL, FALSE);
         }
 
+        // === View Log Text Hover ===
+        bool newHoverLog = (x >= (WINDOW_WIDTH - 150) && x <= WINDOW_WIDTH &&
+            y >= WINDOW_HEIGHT - 40 && y <= WINDOW_HEIGHT);
+
+        if (newHoverLog != g_hoverLog) {
+            g_hoverLog = newHoverLog;
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+
         // === CLOSE BUTTON HOVER ===
         bool newHoverClose = (x >= EXIT_ICON_X && x <= EXIT_ICON_X + ICON_SIZE &&
             y >= ICON_MARGIN && y <= ICON_MARGIN + ICON_SIZE);
@@ -3132,6 +3148,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             newHoverFolder != g_hoverFolder ||
             newHoverGpu != g_hoverGpu ||
             newHoverOutput != g_hoverOutputFolder ||
+            newHoverLog != g_hoverLog ||
             newHoverMinimize != g_hoverMinimize)
         {
             g_hoverClose = newHoverClose;
@@ -3462,8 +3479,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             DeleteObject(pen);
         }
 
+        // === View Log Link (Clickable + Hover Effect) ===
+        std::wstring logLink = L"View Log";
+        COLORREF logColor = g_hoverLog ? RGB(100, 180, 255) : RGB(150, 180, 220);
+        SetTextColor(memDC, logColor);
 
+        // Calculate text width for right alignment
+        SIZE logTextSize;
+        GetTextExtentPoint32W(memDC, logLink.c_str(), (int)logLink.length(), &logTextSize);
+        int logX = WINDOW_WIDTH - 30 - logTextSize.cx; // 30px right margin
 
+        RECT rLog = { logX, WINDOW_HEIGHT - 45, WINDOW_WIDTH - 30, WINDOW_HEIGHT - 10 };
+        DrawTextW(memDC, logLink.c_str(), -1, &rLog, DT_RIGHT | DT_SINGLELINE);
+
+        if (g_hoverLog) {
+            int underlineY = WINDOW_HEIGHT - 24;
+            HPEN pen = CreatePen(PS_SOLID, 3, RGB(100, 180, 180));
+            HPEN oldPen = (HPEN)SelectObject(memDC, pen);
+
+            MoveToEx(memDC, logX, underlineY, nullptr);
+            LineTo(memDC, logX + logTextSize.cx, underlineY);
+
+            SelectObject(memDC, oldPen);
+            DeleteObject(pen);
+        }
 
 
         // Right Settings Panel
@@ -3842,10 +3881,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             swprintf_s(txt, L"%d%%", (int)(pct * 100 + 0.5f));
             DrawTextW(memDC, txt, -1, &rPct, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
+            // AI Working indicator if 0%
+            bool usingAI = (g_state.doUpscale || g_state.doRealESRGAN || g_state.doBgRemoval || g_state.doAutoWB || g_state.doSeamCarving);
+            if (pct == 0.0f && usingAI) {
+                SelectObject(memDC, hSmall);
+                SetTextColor(memDC, RGB(100, 200, 255));
+                int animDots = ((clock() - g_progressAnimTime) / 300) % 4;
+                std::wstring aiText = L"AI working";
+                for (int i = 0; i < animDots; ++i) aiText += L".";
+
+                RECT rAi = { barX, barY + barH + 12, barX + barW, barY + barH + 34 };
+                DrawTextW(memDC, aiText.c_str(), -1, &rAi, DT_LEFT | DT_SINGLELINE);
+            }
+
             // Current file
             SelectObject(memDC, hSmall);
             SetTextColor(memDC, RGB(255, 180, 120));
-            RECT rFile = { barX, barY + barH + 12, barX + barW, barY + barH + 34 };
+            // Shift current file text down if the AI text is drawn
+            int fileYOffset = (pct == 0.0f && usingAI) ? 28 : 12;
+            RECT rFile = { barX, barY + barH + fileYOffset, barX + barW, barY + barH + fileYOffset + 22 };
             std::wstring status;
             { std::lock_guard<std::mutex> l(g_statusMutex); status = g_conversionStatus; }
             if (status.length() > 38) status = status.substr(0, 35) + L"...";
@@ -3856,7 +3910,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             std::wstring fire = L"";
             for (int i = 0; i < dots; ++i) fire += (i & 1) ? L"●" : L"○";
             SetTextColor(memDC, RGB(255, 100, 50));
-            RECT rDots = { barX, barY + barH + 38, barX + barW, barY + barH + 62 };
+            int dotsYOffset = (pct == 0.0f && usingAI) ? 54 : 38;
+            RECT rDots = { barX, barY + barH + dotsYOffset, barX + barW, barY + barH + dotsYOffset + 24 };
             DrawTextW(memDC, fire.c_str(), -1, &rDots, DT_CENTER | DT_SINGLELINE);
         }
 
@@ -4067,8 +4122,15 @@ void InitializePathsAndFolders()
     // Folder where myapp.exe (and EDSR_x2/x3/x4.pb) live
     g_exeDir = exePath;
 
-
-    swprintf_s(g_outputFolder, MAX_PATH, L"%s\\Converted", exePath);
+    // Use Pictures folder for store compatibility (sandbox)
+    PWSTR pszPath = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Pictures, 0, nullptr, &pszPath))) {
+        swprintf_s(g_outputFolder, MAX_PATH, L"%s\\Converted", pszPath);
+        CoTaskMemFree(pszPath);
+    }
+    else {
+        swprintf_s(g_outputFolder, MAX_PATH, L"%s\\Converted", exePath); // Fallback
+    }
 
     // Create the folder if it doesn't exist
     if (!PathIsDirectoryW(g_outputFolder))
@@ -4076,8 +4138,14 @@ void InitializePathsAndFolders()
         CreateDirectoryW(g_outputFolder, nullptr);
     }
 
-    // Always ensure trailing backslash
-   // PathAddBackslashW(g_outputFolder);
+    // Initialize Log Path in Temp folder
+    WCHAR tempPath[MAX_PATH] = { 0 };
+    GetTempPathW(MAX_PATH, tempPath);
+    g_logFilePath = tempPath;
+    if (!g_logFilePath.empty() && g_logFilePath.back() != L'\\') {
+        g_logFilePath += L"\\";
+    }
+    g_logFilePath += L"upscale_debug.log";
 }
 
 
