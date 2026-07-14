@@ -47,6 +47,7 @@
 #include <opencv2/dnn.hpp>
 #include <opencv2/dnn/dnn.hpp>
 #include <opencv2/dnn_superres.hpp>
+#include <opencv2/xphoto/white_balance.hpp>
 
 //////////////////////////
 #pragma warning(push)
@@ -107,7 +108,7 @@ WCHAR g_outputFolder[MAX_PATH] = L"";
 #define ICON_MARGIN 20
 
 
-constexpr int WINDOW_WIDTH = 900;
+constexpr int WINDOW_WIDTH = 1100;
 constexpr int WINDOW_HEIGHT = 820; // bumped +70 to fit the new AI Upscale row
 
 const int PANEL_Y = 130;
@@ -209,7 +210,8 @@ struct AppState {
     bool doSeamCarving = false;
     bool doRealESRGAN = false;
 
-    int resizePercent = 100;
+    int resizeWidth = 1024;
+    int resizeHeight = 768;
 
     // Color conversion options
     enum ColorMode {
@@ -225,8 +227,10 @@ struct AppState {
     int denoiseTemplateWindowSize = 7;
     int denoiseSearchWindowSize = 21;
 
-    std::wstring resizeInput = L"100";
-    bool resizeInputActive = false;
+    std::wstring resizeInputX = L"1024";
+    std::wstring resizeInputY = L"768";
+    bool resizeInputXActive = false;
+    bool resizeInputYActive = false;
 };
 
 AppState g_state;
@@ -692,6 +696,421 @@ bool TryUpscale(cv::Mat& proc, int scale, bool preferGpu, const std::string& pip
 }
 
 /////////////////////////////////////////////////////////////////////////////////
+// Auto White Balance (grayworld algorithm, via opencv_xphoto)
+/////////////////////////////////////////////////////////////////////////////////
+void ApplyAutoWhiteBalance(cv::Mat& proc) {
+    try {
+        cv::Mat bgr;
+        int origChannels = proc.channels();
+        if (origChannels == 4) cv::cvtColor(proc, bgr, cv::COLOR_BGRA2BGR);
+        else if (origChannels == 1) cv::cvtColor(proc, bgr, cv::COLOR_GRAY2BGR);
+        else bgr = proc;
+
+        cv::Ptr<cv::xphoto::GrayworldWB> wb = cv::xphoto::createGrayworldWB();
+        wb->setSaturationThreshold(0.95f);
+
+        cv::Mat balanced;
+        wb->balanceWhite(bgr, balanced);
+
+        if (origChannels == 4) {
+            // Re-attach the original alpha channel rather than inventing one
+            std::vector<cv::Mat> origCh, newCh;
+            cv::split(proc, origCh);
+            cv::cvtColor(balanced, balanced, cv::COLOR_BGR2BGRA);
+            cv::split(balanced, newCh);
+            newCh[3] = origCh[3];
+            cv::merge(newCh, proc);
+        }
+        else if (origChannels == 1) {
+            cv::cvtColor(balanced, proc, cv::COLOR_BGR2GRAY);
+        }
+        else {
+            proc = balanced;
+        }
+        UpscaleLog("AutoWB: grayworld white balance applied successfully.");
+    }
+    catch (const cv::Exception& e) {
+        UpscaleLog(std::string("AutoWB: FAILED - cv::Exception: ") + e.what());
+    }
+    catch (...) {
+        UpscaleLog("AutoWB: FAILED - unknown exception.");
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Background Removal (GrabCut, auto-initialized rectangle)
+// Assumes the subject is roughly centered with a margin around the edges
+// (true for the large majority of product/portrait photos). Produces a
+// BGRA image with the background made transparent. Note: JPG/BMP output
+// formats don't support alpha, so the transparency will be lost if you
+// export to those - use PNG, WEBP, TIF, or GIF to keep it.
+/////////////////////////////////////////////////////////////////////////////////
+void RemoveBackgroundGrabCut(cv::Mat& proc) {
+    try {
+        cv::Mat bgr;
+        int origChannels = proc.channels();
+        if (origChannels == 4) cv::cvtColor(proc, bgr, cv::COLOR_BGRA2BGR);
+        else if (origChannels == 1) cv::cvtColor(proc, bgr, cv::COLOR_GRAY2BGR);
+        else bgr = proc;
+
+        if (bgr.cols < 10 || bgr.rows < 10) {
+            UpscaleLog("BgRemoval: SKIPPED - image too small for GrabCut.");
+            return;
+        }
+
+        int marginX = std::max(1, bgr.cols / 25);
+        int marginY = std::max(1, bgr.rows / 25);
+        cv::Rect rect(marginX, marginY, bgr.cols - 2 * marginX, bgr.rows - 2 * marginY);
+
+        cv::Mat mask(bgr.size(), CV_8UC1, cv::Scalar(cv::GC_BGD));
+        cv::Mat bgdModel, fgdModel;
+
+        cv::grabCut(bgr, mask, rect, bgdModel, fgdModel, 5, cv::GC_INIT_WITH_RECT);
+
+        cv::Mat fgMask = (mask == cv::GC_FGD) | (mask == cv::GC_PR_FGD);
+        cv::Mat alpha;
+        fgMask.convertTo(alpha, CV_8U, 255);
+        cv::GaussianBlur(alpha, alpha, cv::Size(5, 5), 0);
+
+        std::vector<cv::Mat> bgrCh;
+        cv::split(bgr, bgrCh);
+        bgrCh.push_back(alpha);
+        cv::merge(bgrCh, proc); // proc becomes BGRA regardless of original channel count
+
+        UpscaleLog("BgRemoval: GrabCut succeeded, output is BGRA with transparent background.");
+    }
+    catch (const cv::Exception& e) {
+        UpscaleLog(std::string("BgRemoval: FAILED - cv::Exception: ") + e.what());
+    }
+    catch (...) {
+        UpscaleLog("BgRemoval: FAILED - unknown exception.");
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Seam Carving (content-aware resize, classic Avidan & Shamir seam removal)
+// Repeatedly removes the single lowest-energy seam until the target size is
+// reached. Only SHRINKING is supported in either dimension - seam INSERTION
+// (enlarging) is a materially different, more involved algorithm and isn't
+// implemented here. If a requested target is larger than the source in a
+// given dimension, that dimension is left unchanged.
+// NOTE: this is the real O(rows*cols) per-seam algorithm, run once per seam
+// removed - large size reductions on big images can take a while.
+/////////////////////////////////////////////////////////////////////////////////
+namespace SeamCarve {
+
+    inline cv::Mat ComputeEnergy(const cv::Mat& bgr) {
+        cv::Mat gray, gx, gy, energy;
+        cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+        cv::Sobel(gray, gx, CV_32F, 1, 0, 3);
+        cv::Sobel(gray, gy, CV_32F, 0, 1, 3);
+        cv::magnitude(gx, gy, energy);
+        return energy;
+    }
+
+    // Removes exactly one lowest-energy vertical seam from `img` (width -1)
+    inline void RemoveVerticalSeam(cv::Mat& img) {
+        cv::Mat energy = ComputeEnergy(img);
+        int rows = energy.rows, cols = energy.cols;
+
+        cv::Mat cost = energy.clone();
+        cv::Mat backtrack(rows, cols, CV_32S, cv::Scalar(0));
+
+        for (int y = 1; y < rows; y++) {
+            for (int x = 0; x < cols; x++) {
+                float best = cost.at<float>(y - 1, x);
+                int bestX = x;
+                if (x > 0 && cost.at<float>(y - 1, x - 1) < best) {
+                    best = cost.at<float>(y - 1, x - 1);
+                    bestX = x - 1;
+                }
+                if (x < cols - 1 && cost.at<float>(y - 1, x + 1) < best) {
+                    best = cost.at<float>(y - 1, x + 1);
+                    bestX = x + 1;
+                }
+                cost.at<float>(y, x) += best;
+                backtrack.at<int>(y, x) = bestX;
+            }
+        }
+
+        int minX = 0;
+        float minVal = cost.at<float>(rows - 1, 0);
+        for (int x = 1; x < cols; x++) {
+            if (cost.at<float>(rows - 1, x) < minVal) {
+                minVal = cost.at<float>(rows - 1, x);
+                minX = x;
+            }
+        }
+
+        std::vector<int> seam(rows);
+        seam[rows - 1] = minX;
+        for (int y = rows - 2; y >= 0; y--) {
+            seam[y] = backtrack.at<int>(y + 1, seam[y + 1]);
+        }
+
+        cv::Mat result(rows, cols - 1, img.type());
+        for (int y = 0; y < rows; y++) {
+            int sx = seam[y];
+            if (sx > 0) img.row(y).colRange(0, sx).copyTo(result.row(y).colRange(0, sx));
+            if (sx < cols - 1) img.row(y).colRange(sx + 1, cols).copyTo(result.row(y).colRange(sx, cols - 1));
+        }
+        img = result;
+    }
+
+    inline void Resize(cv::Mat& img, int targetW, int targetH) {
+        if (targetW > 0 && targetW < img.cols) {
+            int toRemove = img.cols - targetW;
+            for (int i = 0; i < toRemove; i++) RemoveVerticalSeam(img);
+        }
+        if (targetH > 0 && targetH < img.rows) {
+            cv::Mat transposed;
+            cv::transpose(img, transposed);
+            int toRemove = img.rows - targetH;
+            for (int i = 0; i < toRemove; i++) RemoveVerticalSeam(transposed);
+            cv::transpose(transposed, img);
+        }
+    }
+}
+
+void ApplySeamCarving(cv::Mat& proc, int targetW, int targetH) {
+    try {
+        if (targetW <= 0 || targetH <= 0) {
+            UpscaleLog("SeamCarving: SKIPPED - invalid target dimensions.");
+            return;
+        }
+        if (targetW >= proc.cols && targetH >= proc.rows) {
+            UpscaleLog("SeamCarving: SKIPPED - target is not smaller than source in "
+                "either dimension (only shrinking/seam-removal is implemented).");
+            return;
+        }
+
+        cv::Mat bgr;
+        int origChannels = proc.channels();
+        if (origChannels == 4) cv::cvtColor(proc, bgr, cv::COLOR_BGRA2BGR);
+        else if (origChannels == 1) cv::cvtColor(proc, bgr, cv::COLOR_GRAY2BGR);
+        else bgr = proc;
+
+        int clampedW = std::min(targetW, bgr.cols);
+        int clampedH = std::min(targetH, bgr.rows);
+
+        UpscaleLog("SeamCarving: reducing " + std::to_string(bgr.cols) + "x" + std::to_string(bgr.rows) +
+            " -> " + std::to_string(clampedW) + "x" + std::to_string(clampedH) + " (content-aware seam removal)");
+
+        SeamCarve::Resize(bgr, clampedW, clampedH);
+
+        if (origChannels == 4) cv::cvtColor(bgr, proc, cv::COLOR_BGR2BGRA);
+        else if (origChannels == 1) cv::cvtColor(bgr, proc, cv::COLOR_BGR2GRAY);
+        else proc = bgr;
+
+        UpscaleLog("SeamCarving: SUCCESS -> output " + std::to_string(proc.cols) + "x" + std::to_string(proc.rows));
+    }
+    catch (const cv::Exception& e) {
+        UpscaleLog(std::string("SeamCarving: FAILED - cv::Exception: ") + e.what());
+    }
+    catch (...) {
+        UpscaleLog("SeamCarving: FAILED - unknown exception.");
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Real-ESRGAN Super-Resolution (generic ONNX via cv::dnn)
+// dnn_superres only knows EDSR/ESPCN/FSRCNN/LapSRN, not ESRGAN, so Real-ESRGAN
+// runs through the generic cv::dnn ONNX runtime instead. Looks for a model
+// named RealESRGAN_x{scale}.onnx next to the .exe, in the same folder as the
+// EDSR_x{2,3,4}.pb files. YOU MUST SUPPLY THIS FILE YOURSELF (export a
+// Real-ESRGAN checkpoint to ONNX) - it is not bundled, exactly like the EDSR
+// models aren't bundled either. If the file isn't found, this cleanly no-ops
+// (image left unchanged for this step) rather than crashing.
+/////////////////////////////////////////////////////////////////////////////////
+class RealESRGANUpscaler {
+public:
+    bool load(int scale, const std::wstring& exeDir) {
+        if (ready && loadedScale == scale) return true;
+
+        // Real-ESRGAN only ever ships as x2/x4 (the architecture itself was only
+        // trained at those two scales, upstream at xinntao/Real-ESRGAN) - there is
+        // no x3 variant to look for.
+        if (scale != 2 && scale != 4) {
+            UpscaleLog("RealESRGAN load(): FAILED - scale=" + std::to_string(scale) +
+                " has no Real-ESRGAN model (only x2 and x4 exist).");
+            ready = false;
+            return false;
+        }
+
+        // Different community ONNX exports use different filenames/locations.
+        // Try the common ones so users don't have to rename anything by hand.
+        std::wstring baseName = L"RealESRGAN_x" + std::to_wstring(scale);
+        std::vector<std::wstring> candidates = {
+            exeDir + L"\\" + baseName + L".onnx",
+            exeDir + L"\\" + baseName + L"_fp16.onnx",
+            exeDir + L"\\RealEsrganONNX\\" + baseName + L".onnx",
+            exeDir + L"\\RealEsrganONNX\\" + baseName + L"_fp16.onnx",
+        };
+
+        std::wstring fullPath;
+        bool found = false;
+        for (const auto& candidate : candidates) {
+            UpscaleLog("RealESRGAN load(): checking for model at: " + WideToUtf8Log(candidate));
+            if (PathFileExistsW(candidate.c_str())) {
+                fullPath = candidate;
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            UpscaleLog("RealESRGAN load(): FAILED - no model file found. Place " +
+                WideToUtf8Log(baseName) + ".onnx (or _fp16.onnx, optionally inside a "
+                "RealEsrganONNX subfolder) next to the .exe to enable this feature.");
+            ready = false;
+            return false;
+        }
+
+        try {
+            net = cv::dnn::readNetFromONNX(WideToUtf8Log(fullPath));
+            if (net.empty()) {
+                UpscaleLog("RealESRGAN load(): FAILED - readNetFromONNX returned an empty net.");
+                ready = false;
+                return false;
+            }
+            net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+            net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+            loadedScale = scale;
+            ready = true;
+            UpscaleLog("RealESRGAN load(): SUCCESS for scale=" + std::to_string(scale) +
+                " using " + WideToUtf8Log(fullPath));
+            return true;
+        }
+        catch (const cv::Exception& e) {
+            UpscaleLog(std::string("RealESRGAN load(): FAILED - cv::Exception: ") + e.what());
+            ready = false;
+            return false;
+        }
+    }
+
+    bool upsampleTile(const cv::Mat& bgrInput, cv::Mat& bgrOutput) {
+        if (!ready) return false;
+        try {
+            cv::Mat blob = cv::dnn::blobFromImage(bgrInput, 1.0 / 255.0, cv::Size(), cv::Scalar(), true, false, CV_32F);
+            net.setInput(blob);
+            cv::Mat outBlob = net.forward();
+
+            int outH = outBlob.size[2];
+            int outW = outBlob.size[3];
+            std::vector<cv::Mat> channels;
+            for (int c = 0; c < 3; c++) {
+                channels.emplace_back(outH, outW, CV_32F, outBlob.ptr<float>(0, c));
+            }
+            cv::Mat merged;
+            cv::merge(channels, merged); // RGB order (input blob used swapRB)
+            cv::cvtColor(merged, merged, cv::COLOR_RGB2BGR);
+            cv::min(merged, 1.0, merged);
+            cv::max(merged, 0.0, merged);
+            merged.convertTo(bgrOutput, CV_8UC3, 255.0);
+            return true;
+        }
+        catch (const cv::Exception& e) {
+            UpscaleLog(std::string("RealESRGAN upsampleTile(): FAILED - cv::Exception: ") + e.what());
+            return false;
+        }
+    }
+
+    // Tiles the image the same way EDSR does, to keep memory flat on large inputs.
+    bool upsampleTiled(const cv::Mat& input, cv::Mat& output, int tileSize = 128, int overlap = 8) {
+        if (!ready) return false;
+        int scale = loadedScale;
+
+        if (input.cols <= tileSize && input.rows <= tileSize) {
+            return upsampleTile(input, output);
+        }
+
+        try {
+            output.create(input.rows * scale, input.cols * scale, input.type());
+        }
+        catch (const cv::Exception& e) {
+            UpscaleLog(std::string("RealESRGAN upsampleTiled(): FAILED to allocate output: ") + e.what());
+            return false;
+        }
+
+        for (int ty = 0; ty < input.rows; ty += tileSize) {
+            for (int tx = 0; tx < input.cols; tx += tileSize) {
+                int x0Ideal = tx - overlap, y0Ideal = ty - overlap;
+                int x1Ideal = tx + tileSize + overlap, y1Ideal = ty + tileSize + overlap;
+                int x0Clip = std::max(0, x0Ideal), y0Clip = std::max(0, y0Ideal);
+                int x1Clip = std::min(input.cols, x1Ideal), y1Clip = std::min(input.rows, y1Ideal);
+                int padLeft = x0Clip - x0Ideal, padTop = y0Clip - y0Ideal;
+                int padRight = x1Ideal - x1Clip, padBottom = y1Ideal - y1Clip;
+
+                cv::Mat rawTile = input(cv::Range(y0Clip, y1Clip), cv::Range(x0Clip, x1Clip));
+                cv::Mat tile;
+                if (padLeft || padTop || padRight || padBottom)
+                    cv::copyMakeBorder(rawTile, tile, padTop, padBottom, padLeft, padRight, cv::BORDER_REFLECT_101);
+                else
+                    tile = rawTile;
+
+                cv::Mat upTile;
+                if (!upsampleTile(tile, upTile)) {
+                    UpscaleLog("RealESRGAN upsampleTiled(): FAILED on tile at (" +
+                        std::to_string(tx) + "," + std::to_string(ty) + ").");
+                    return false;
+                }
+
+                int coreH = std::min(tileSize, input.rows - ty);
+                int coreW = std::min(tileSize, input.cols - tx);
+                int cropY = overlap * scale, cropX = overlap * scale;
+
+                cv::Mat coreTile = upTile(cv::Range(cropY, cropY + coreH * scale),
+                    cv::Range(cropX, cropX + coreW * scale));
+                coreTile.copyTo(output(cv::Range(ty * scale, ty * scale + coreH * scale),
+                    cv::Range(tx * scale, tx * scale + coreW * scale)));
+            }
+        }
+        return true;
+    }
+
+    bool isReady() const { return ready; }
+
+private:
+    cv::dnn::Net net;
+    int loadedScale = 0;
+    bool ready = false;
+};
+
+RealESRGANUpscaler g_realEsrgan;
+std::mutex g_realEsrganMutex;
+
+// Single entry point for Real-ESRGAN. Mirrors TryUpscale()'s contract: returns
+// false and leaves `proc` unchanged if the model is missing or inference fails,
+// rather than throwing or crashing the pipeline.
+bool TryRealESRGAN(cv::Mat& proc, int scale, const std::string& pipelineTag) {
+    std::lock_guard<std::mutex> lock(g_realEsrganMutex);
+    UpscaleLog(pipelineTag + ": attempting Real-ESRGAN upscale, factor=" + std::to_string(scale) +
+        ", input=" + std::to_string(proc.cols) + "x" + std::to_string(proc.rows));
+
+    if (!g_realEsrgan.load(scale, g_exeDir)) {
+        UpscaleLog(pipelineTag + ": Real-ESRGAN model unavailable - image left unchanged for this step.");
+        return false;
+    }
+
+    cv::Mat bgr;
+    int origChannels = proc.channels();
+    if (origChannels == 4) cv::cvtColor(proc, bgr, cv::COLOR_BGRA2BGR);
+    else if (origChannels == 1) cv::cvtColor(proc, bgr, cv::COLOR_GRAY2BGR);
+    else bgr = proc;
+
+    cv::Mat up;
+    if (!g_realEsrgan.upsampleTiled(bgr, up)) {
+        UpscaleLog(pipelineTag + ": Real-ESRGAN FAILED - image left unchanged.");
+        return false;
+    }
+
+    proc = up; // always comes back as 3-channel BGR
+    UpscaleLog(pipelineTag + ": Real-ESRGAN SUCCESS -> output " +
+        std::to_string(proc.cols) + "x" + std::to_string(proc.rows));
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////
 // ThreadPool 
 ////////////////////////////////////////////////////////////////////////////////
 class ThreadPool {
@@ -916,9 +1335,13 @@ private:
             // CPU pipeline
             cv::Mat proc = image;
 
-            if (state.doResize && state.resizePercent != 100) {
-                double scale = state.resizePercent / 100.0;
-                cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+            if (state.doSeamCarving) {
+                // Content-aware resize takes priority over the plain resize when both
+                // are checked - they both target the same resizeWidth/resizeHeight.
+                ApplySeamCarving(proc, state.resizeWidth, state.resizeHeight);
+            }
+            else if (state.doResize) {
+                cv::Size s(state.resizeWidth, state.resizeHeight);
                 if (s.width > 0 && s.height > 0) cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
             }
 
@@ -947,6 +1370,10 @@ private:
                 }
             }
 
+            if (state.doAutoWB) {
+                ApplyAutoWhiteBalance(proc);
+            }
+
             if (state.doDenoise) {
                 // NEW DENOISE WITH STRENGTH CONTROL
                 int h = state.denoiseStrength;
@@ -967,7 +1394,28 @@ private:
                 }
             }
 
-            if (state.doUpscale) {
+            if (state.doBgRemoval) {
+                RemoveBackgroundGrabCut(proc);
+            }
+
+            // Real-ESRGAN only exists as x2/x4 - if x3 is selected while it's
+            // checked, fall back to EDSR x3 instead of silently doing nothing.
+            bool useRealEsrgan = state.doRealESRGAN && (state.upscaleFactor == 2 || state.upscaleFactor == 4);
+            if (state.doRealESRGAN && !useRealEsrgan) {
+                UpscaleLog("convertImageCPU: Real-ESRGAN has no native x3 model (only x2/x4) - falling back to EDSR x3.");
+            }
+
+            if (useRealEsrgan) {
+                // AI upscalers are mutually exclusive - Real-ESRGAN takes priority
+                // over EDSR when both are checked, so the image isn't upscaled twice.
+                TryRealESRGAN(proc, state.upscaleFactor, "convertImageCPU");
+            }
+            else if (state.doUpscale || state.doRealESRGAN) {
+                // EDSR/dnn_superres only accepts 3-channel BGR - normalize regardless
+                // of whether the Color Convert option is enabled, otherwise images with
+                // an alpha channel (4ch) or grayscale (1ch) silently fail to upscale.
+                if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2BGR);
+                else if (proc.channels() == 1) cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGR);
                 TryUpscale(proc, state.upscaleFactor, state.useGpu, "convertImageCPU");
             }
 
@@ -995,10 +1443,15 @@ private:
             gpuMat.upload(cpuImg);
             cv::cuda::GpuMat proc = gpuMat;
 
-            // Resize
-            if (state.doResize && state.resizePercent != 100) {
-                double scale = state.resizePercent / 100.0;
-                cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+            // Resize / Seam Carving (seam carving has no CUDA path - runs on CPU)
+            if (state.doSeamCarving) {
+                cv::Mat tmp;
+                proc.download(tmp);
+                ApplySeamCarving(tmp, state.resizeWidth, state.resizeHeight);
+                proc.upload(tmp);
+            }
+            else if (state.doResize) {
+                cv::Size s(state.resizeWidth, state.resizeHeight);
                 if (s.width > 0 && s.height > 0) {
                     cv::cuda::GpuMat tmp;
                     cv::cuda::resize(proc, tmp, s, 0, 0, cv::INTER_LINEAR);
@@ -1103,7 +1556,29 @@ private:
             cv::Mat result;
             proc.download(result);
 
-            if (state.doUpscale) {
+            if (state.doAutoWB) {
+                ApplyAutoWhiteBalance(result);
+            }
+
+            if (state.doBgRemoval) {
+                RemoveBackgroundGrabCut(result);
+            }
+
+            bool useRealEsrgan = state.doRealESRGAN && (state.upscaleFactor == 2 || state.upscaleFactor == 4);
+            if (state.doRealESRGAN && !useRealEsrgan) {
+                UpscaleLog("convertImageCUDA: Real-ESRGAN has no native x3 model (only x2/x4) - falling back to EDSR x3.");
+            }
+
+            if (useRealEsrgan) {
+                // AI upscalers are mutually exclusive - Real-ESRGAN takes priority
+                // over EDSR when both are checked, so the image isn't upscaled twice.
+                TryRealESRGAN(result, state.upscaleFactor, "convertImageCUDA");
+            }
+            else if (state.doUpscale || state.doRealESRGAN) {
+                // EDSR/dnn_superres only accepts 3-channel BGR - normalize regardless
+                // of whether the Color Convert option is enabled.
+                if (result.channels() == 4) cv::cvtColor(result, result, cv::COLOR_BGRA2BGR);
+                else if (result.channels() == 1) cv::cvtColor(result, result, cv::COLOR_GRAY2BGR);
                 TryUpscale(result, state.upscaleFactor, true, "convertImageCUDA");
             }
 
@@ -1137,9 +1612,16 @@ private:
 
             cv::UMat proc = u;
 
-            if (state.doResize && state.resizePercent != 100) {
-                double scale = state.resizePercent / 100.0;
-                cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+            if (state.doSeamCarving) {
+                // Content-aware resize takes priority over the plain resize when both
+                // are checked - runs on CPU (no UMat implementation of seam carving).
+                cv::Mat tmp;
+                proc.copyTo(tmp);
+                ApplySeamCarving(tmp, state.resizeWidth, state.resizeHeight);
+                tmp.copyTo(proc);
+            }
+            else if (state.doResize) {
+                cv::Size s(state.resizeWidth, state.resizeHeight);
                 if (s.width > 0 && s.height > 0) cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
             }
 
@@ -1190,7 +1672,29 @@ private:
             cv::Mat result;
             proc.copyTo(result);
 
-            if (state.doUpscale) {
+            if (state.doAutoWB) {
+                ApplyAutoWhiteBalance(result);
+            }
+
+            if (state.doBgRemoval) {
+                RemoveBackgroundGrabCut(result);
+            }
+
+            bool useRealEsrgan = state.doRealESRGAN && (state.upscaleFactor == 2 || state.upscaleFactor == 4);
+            if (state.doRealESRGAN && !useRealEsrgan) {
+                UpscaleLog("convertImageOCL: Real-ESRGAN has no native x3 model (only x2/x4) - falling back to EDSR x3.");
+            }
+
+            if (useRealEsrgan) {
+                // AI upscalers are mutually exclusive - Real-ESRGAN takes priority
+                // over EDSR when both are checked, so the image isn't upscaled twice.
+                TryRealESRGAN(result, state.upscaleFactor, "convertImageOCL");
+            }
+            else if (state.doUpscale || state.doRealESRGAN) {
+                // EDSR/dnn_superres only accepts 3-channel BGR - normalize regardless
+                // of whether the Color Convert option is enabled.
+                if (result.channels() == 4) cv::cvtColor(result, result, cv::COLOR_BGRA2BGR);
+                else if (result.channels() == 1) cv::cvtColor(result, result, cv::COLOR_GRAY2BGR);
                 // Intel iGPUs typically surface here via OpenCL; prefer OpenVINO for the SR net
                 TryUpscale(result, state.upscaleFactor, false, "convertImageOCL");
             }
@@ -1443,9 +1947,8 @@ private:
                         cv::cuda::GpuMat gpuProc = gpuMat;
 
                         // Resize
-                        if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
-                            double scale = stateSnapshot.resizePercent / 100.0;
-                            cv::Size s((int)(gpuProc.cols * scale), (int)(gpuProc.rows * scale));
+                        if (stateSnapshot.doResize) {
+                            cv::Size s(stateSnapshot.resizeWidth, stateSnapshot.resizeHeight);
                             if (s.width > 0 && s.height > 0) {
                                 cv::cuda::GpuMat tmp;
                                 cv::cuda::resize(gpuProc, tmp, s, 0, 0, cv::INTER_LINEAR);
@@ -1525,9 +2028,8 @@ private:
                         proc.copyTo(uProc);
 
                         // Resize
-                        if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
-                            double scale = stateSnapshot.resizePercent / 100.0;
-                            cv::Size s((int)(uProc.cols * scale), (int)(uProc.rows * scale));
+                        if (stateSnapshot.doResize) {
+                            cv::Size s(stateSnapshot.resizeWidth, stateSnapshot.resizeHeight);
                             if (s.width > 0 && s.height > 0) {
                                 cv::resize(uProc, uProc, s, 0, 0, cv::INTER_LINEAR);
                             }
@@ -1562,9 +2064,8 @@ private:
             }
             else {
                 // === CPU PIPELINE (or denoising required) ===
-                if (stateSnapshot.doResize && stateSnapshot.resizePercent != 100) {
-                    double scale = stateSnapshot.resizePercent / 100.0;
-                    cv::Size s((int)(proc.cols * scale), (int)(proc.rows * scale));
+                if (stateSnapshot.doResize) {
+                    cv::Size s(stateSnapshot.resizeWidth, stateSnapshot.resizeHeight);
                     if (s.width > 0 && s.height > 0) {
                         cv::resize(proc, proc, s, 0, 0, cv::INTER_LINEAR);
                     }
@@ -1609,6 +2110,10 @@ private:
 
             // === STEP 2.5: AI UPSCALE (EDSR) — runs once, after resize/color/denoise ===
             if (stateSnapshot.doUpscale) {
+                // EDSR/dnn_superres only accepts 3-channel BGR - normalize regardless
+                // of whether the Color Convert option is enabled.
+                if (proc.channels() == 4) cv::cvtColor(proc, proc, cv::COLOR_BGRA2BGR);
+                else if (proc.channels() == 1) cv::cvtColor(proc, proc, cv::COLOR_GRAY2BGR);
                 bool gpuPathTaken = (useGpu && gpu_device.isAvailable() && !stateSnapshot.doDenoise);
                 TryUpscale(proc, stateSnapshot.upscaleFactor,
                     gpuPathTaken && gpu_device.isCuda(), "AsyncWorker");
@@ -2081,10 +2586,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     const int CHK_DENOISE_Y = CHK_COLOR_Y + 40;
 
     // Resize input field
-    const int RESIZE_INPUT_X = CHK_RESIZE_X + 120;
-    const int RESIZE_INPUT_Y = CHK_RESIZE_Y;
-    const int RESIZE_INPUT_W = 60;
+    const int RESIZE_INPUT_X_X = CHK_RESIZE_X + 100;
+    const int RESIZE_INPUT_X_Y = CHK_RESIZE_Y;
+    const int RESIZE_INPUT_X_W = 50;
     const int RESIZE_INPUT_H = 25;
+
+    const int RESIZE_INPUT_Y_X = RESIZE_INPUT_X_X + RESIZE_INPUT_X_W + 20; // +20 for "x" char
+    const int RESIZE_INPUT_Y_Y = CHK_RESIZE_Y;
+    const int RESIZE_INPUT_Y_W = 50;
 
     // Color mode selection (below color checkbox)
     const int COLOR_MODE_Y = CHK_COLOR_Y + 30;
@@ -2119,7 +2628,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     HFONT hFonto = NULL;
 
     // Static variables for controls
-    static HWND g_hResizeEdit = nullptr;
+    static HWND g_hResizeEditX = nullptr;
+    static HWND g_hResizeEditY = nullptr;
     static bool g_bIsDraggingDenoiseSlider = false;
     static bool g_hoverFolder = false;
     static bool g_hoverGpu = false;
@@ -2166,24 +2676,32 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
 
 
-        // Create edit control for resize input
-        g_hResizeEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"100",
+        // Create edit controls for resize input
+        g_hResizeEditX = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"1024",
             WS_CHILD | ES_NUMBER | ES_RIGHT,
-            RESIZE_INPUT_X, RESIZE_INPUT_Y, RESIZE_INPUT_W, RESIZE_INPUT_H,
+            RESIZE_INPUT_X_X, RESIZE_INPUT_X_Y, RESIZE_INPUT_X_W, RESIZE_INPUT_H,
             hWnd, (HMENU)1004, hInst, NULL);
 
-        // Limit to 3 digits (max 100%)
-        SendMessage(g_hResizeEdit, EM_SETLIMITTEXT, 3, 0);
+        g_hResizeEditY = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"768",
+            WS_CHILD | ES_NUMBER | ES_RIGHT,
+            RESIZE_INPUT_Y_X, RESIZE_INPUT_Y_Y, RESIZE_INPUT_Y_W, RESIZE_INPUT_H,
+            hWnd, (HMENU)1005, hInst, NULL);
+
+        // Limit to 5 digits (e.g. 10000)
+        SendMessage(g_hResizeEditX, EM_SETLIMITTEXT, 5, 0);
+        SendMessage(g_hResizeEditY, EM_SETLIMITTEXT, 5, 0);
 
         // Set font
         hFonto = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        SendMessage(g_hResizeEdit, WM_SETFONT, (WPARAM)hFonto, TRUE);
+        SendMessage(g_hResizeEditX, WM_SETFONT, (WPARAM)hFonto, TRUE);
+        SendMessage(g_hResizeEditY, WM_SETFONT, (WPARAM)hFonto, TRUE);
         DeleteObject(hFonto);
 
-        // Initially hide it
-        ShowWindow(g_hResizeEdit, SW_HIDE);
+        // Initially hide them
+        ShowWindow(g_hResizeEditX, SW_HIDE);
+        ShowWindow(g_hResizeEditY, SW_HIDE);
         return 0;
     }
 
@@ -2221,20 +2739,34 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         int id = LOWORD(wParam);
         int code = HIWORD(wParam);
 
-        if (id == 1004 && code == EN_KILLFOCUS) { // Edit control lost focus
+        if (id == 1004 && code == EN_KILLFOCUS) { // Edit control X lost focus
             wchar_t buffer[10];
-            GetWindowText(g_hResizeEdit, buffer, 10);
+            GetWindowText(g_hResizeEditX, buffer, 10);
 
-            int percent = _wtoi(buffer);
-            if (percent < 10) percent = 10;
-            if (percent > 100) percent = 100;
+            int width = _wtoi(buffer);
+            if (width < 1) width = 1;
 
-            g_state.resizePercent = percent;
-            swprintf_s(buffer, L"%d", percent);
-            g_state.resizeInput = buffer;
+            g_state.resizeWidth = width;
+            swprintf_s(buffer, L"%d", width);
+            g_state.resizeInputX = buffer;
 
-            g_state.resizeInputActive = false;
-            ShowWindow(g_hResizeEdit, SW_HIDE);
+            g_state.resizeInputXActive = false;
+            ShowWindow(g_hResizeEditX, SW_HIDE);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        else if (id == 1005 && code == EN_KILLFOCUS) { // Edit control Y lost focus
+            wchar_t buffer[10];
+            GetWindowText(g_hResizeEditY, buffer, 10);
+
+            int height = _wtoi(buffer);
+            if (height < 1) height = 1;
+
+            g_state.resizeHeight = height;
+            swprintf_s(buffer, L"%d", height);
+            g_state.resizeInputY = buffer;
+
+            g_state.resizeInputYActive = false;
+            ShowWindow(g_hResizeEditY, SW_HIDE);
             InvalidateRect(hWnd, NULL, FALSE);
         }
         return 0;
@@ -2335,10 +2867,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             if (x >= CHK_RESIZE_X && x <= CHK_RESIZE_X + CHK_SIZE &&
                 y >= CHK_RESIZE_Y && y <= CHK_RESIZE_Y + CHK_SIZE) {
                 g_state.doResize = !g_state.doResize;
-                if (g_state.doResize && g_state.resizePercent == 100) {
-                    g_state.resizePercent = 100;
-                    g_state.resizeInput = L"100";
-                }
                 InvalidateRect(hWnd, NULL, FALSE);
                 handled = true;
             }
@@ -2428,15 +2956,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
 
 
-            // Resize input field click
+            // Resize input X field click
             else if (g_state.doResize &&
-                x >= RESIZE_INPUT_X && x <= RESIZE_INPUT_X + RESIZE_INPUT_W &&
-                y >= RESIZE_INPUT_Y && y <= RESIZE_INPUT_Y + RESIZE_INPUT_H) {
-                g_state.resizeInputActive = true;
-                ShowWindow(g_hResizeEdit, SW_SHOW);
-                SetWindowText(g_hResizeEdit, g_state.resizeInput.c_str());
-                SetFocus(g_hResizeEdit);
-                SendMessage(g_hResizeEdit, EM_SETSEL, 0, -1);
+                x >= RESIZE_INPUT_X_X && x <= RESIZE_INPUT_X_X + RESIZE_INPUT_X_W &&
+                y >= RESIZE_INPUT_X_Y && y <= RESIZE_INPUT_X_Y + RESIZE_INPUT_H) {
+                g_state.resizeInputXActive = true;
+                ShowWindow(g_hResizeEditX, SW_SHOW);
+                SetWindowText(g_hResizeEditX, g_state.resizeInputX.c_str());
+                SetFocus(g_hResizeEditX);
+                SendMessage(g_hResizeEditX, EM_SETSEL, 0, -1);
+                InvalidateRect(hWnd, NULL, FALSE);
+                handled = true;
+            }
+            // Resize input Y field click
+            else if (g_state.doResize &&
+                x >= RESIZE_INPUT_Y_X && x <= RESIZE_INPUT_Y_X + RESIZE_INPUT_Y_W &&
+                y >= RESIZE_INPUT_Y_Y && y <= RESIZE_INPUT_Y_Y + RESIZE_INPUT_H) {
+                g_state.resizeInputYActive = true;
+                ShowWindow(g_hResizeEditY, SW_SHOW);
+                SetWindowText(g_hResizeEditY, g_state.resizeInputY.c_str());
+                SetFocus(g_hResizeEditY);
+                SendMessage(g_hResizeEditY, EM_SETSEL, 0, -1);
                 InvalidateRect(hWnd, NULL, FALSE);
                 handled = true;
             }
@@ -2491,9 +3031,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
 
         // Click outside resize input deactivates it
-        if (g_state.resizeInputActive && !handled) {
-            g_state.resizeInputActive = false;
-            ShowWindow(g_hResizeEdit, SW_HIDE);
+        if (g_state.resizeInputXActive && !handled) {
+            g_state.resizeInputXActive = false;
+            ShowWindow(g_hResizeEditX, SW_HIDE);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        if (g_state.resizeInputYActive && !handled) {
+            g_state.resizeInputYActive = false;
+            ShowWindow(g_hResizeEditY, SW_HIDE);
             InvalidateRect(hWnd, NULL, FALSE);
         }
 
@@ -2631,32 +3176,54 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_CHAR: {
-        if (g_state.resizeInputActive && wParam >= '0' && wParam <= '9') {
-            // Only allow digits
-            if (g_state.resizeInput.length() < 3) { // Max 3 digits (100%)
-                g_state.resizeInput += static_cast<wchar_t>(wParam);
-                g_state.resizePercent = _wtoi(g_state.resizeInput.c_str());
+        if (g_state.resizeInputXActive && wParam >= '0' && wParam <= '9') {
+            if (g_state.resizeInputX.length() < 5) {
+                g_state.resizeInputX += static_cast<wchar_t>(wParam);
+                g_state.resizeWidth = _wtoi(g_state.resizeInputX.c_str());
                 InvalidateRect(hWnd, NULL, FALSE);
             }
         }
-        else if (g_state.resizeInputActive && wParam == VK_BACK) {
-            // Backspace
-            if (!g_state.resizeInput.empty()) {
-                g_state.resizeInput.pop_back();
-                if (g_state.resizeInput.empty()) {
-                    g_state.resizeInput = L"100";
-                    g_state.resizePercent = 100;
+        else if (g_state.resizeInputXActive && wParam == VK_BACK) {
+            if (!g_state.resizeInputX.empty()) {
+                g_state.resizeInputX.pop_back();
+                if (g_state.resizeInputX.empty()) {
+                    g_state.resizeInputX = L"1";
+                    g_state.resizeWidth = 1;
                 }
                 else {
-                    g_state.resizePercent = _wtoi(g_state.resizeInput.c_str());
+                    g_state.resizeWidth = _wtoi(g_state.resizeInputX.c_str());
                 }
                 InvalidateRect(hWnd, NULL, FALSE);
             }
         }
-        else if (g_state.resizeInputActive && wParam == VK_RETURN) {
-            // Enter to finish
-            g_state.resizeInputActive = false;
-            ShowWindow(g_hResizeEdit, SW_HIDE);
+        else if (g_state.resizeInputXActive && wParam == VK_RETURN) {
+            g_state.resizeInputXActive = false;
+            ShowWindow(g_hResizeEditX, SW_HIDE);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        else if (g_state.resizeInputYActive && wParam >= '0' && wParam <= '9') {
+            if (g_state.resizeInputY.length() < 5) {
+                g_state.resizeInputY += static_cast<wchar_t>(wParam);
+                g_state.resizeHeight = _wtoi(g_state.resizeInputY.c_str());
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+        }
+        else if (g_state.resizeInputYActive && wParam == VK_BACK) {
+            if (!g_state.resizeInputY.empty()) {
+                g_state.resizeInputY.pop_back();
+                if (g_state.resizeInputY.empty()) {
+                    g_state.resizeInputY = L"1";
+                    g_state.resizeHeight = 1;
+                }
+                else {
+                    g_state.resizeHeight = _wtoi(g_state.resizeInputY.c_str());
+                }
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+        }
+        else if (g_state.resizeInputYActive && wParam == VK_RETURN) {
+            g_state.resizeInputYActive = false;
+            ShowWindow(g_hResizeEditY, SW_HIDE);
             InvalidateRect(hWnd, NULL, FALSE);
         }
         return 0;
@@ -2665,9 +3232,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     case WM_KEYDOWN: {
         if (wParam == VK_ESCAPE) {
             // If in resize input mode, exit it first
-            if (g_state.resizeInputActive) {
-                g_state.resizeInputActive = false;
-                ShowWindow(g_hResizeEdit, SW_HIDE);
+            if (g_state.resizeInputXActive) {
+                g_state.resizeInputXActive = false;
+                ShowWindow(g_hResizeEditX, SW_HIDE);
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            else if (g_state.resizeInputYActive) {
+                g_state.resizeInputYActive = false;
+                ShowWindow(g_hResizeEditY, SW_HIDE);
                 InvalidateRect(hWnd, NULL, FALSE);
             }
             else {
@@ -2923,27 +3495,43 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                               CHK_RESIZE_X + 200, CHK_RESIZE_Y + CHK_SIZE };
         DrawTextW(memDC, L"Resize", -1, &rResizeLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        // Resize percentage input (only show when resize is checked)
+        // Resize width/height inputs (only show when resize is checked)
         if (g_state.doResize) {
-            // Only draw static text if not editing
-            if (!g_state.resizeInputActive) {
-                DrawRoundedRect(memDC, RESIZE_INPUT_X, RESIZE_INPUT_Y,
-                    RESIZE_INPUT_W, RESIZE_INPUT_H, 4, RGB(40, 60, 100));
+            // X Input (Width)
+            if (!g_state.resizeInputXActive) {
+                DrawRoundedRect(memDC, RESIZE_INPUT_X_X, RESIZE_INPUT_X_Y,
+                    RESIZE_INPUT_X_W, RESIZE_INPUT_H, 4, RGB(40, 60, 100));
 
                 SetTextColor(memDC, RGB(255, 255, 255));
-                RECT rResizeInput = { RESIZE_INPUT_X + 5, RESIZE_INPUT_Y,
-                                      RESIZE_INPUT_X + RESIZE_INPUT_W - 5, RESIZE_INPUT_Y + RESIZE_INPUT_H };
+                RECT rResizeInputX = { RESIZE_INPUT_X_X + 5, RESIZE_INPUT_X_Y,
+                                      RESIZE_INPUT_X_X + RESIZE_INPUT_X_W - 5, RESIZE_INPUT_X_Y + RESIZE_INPUT_H };
 
-                wchar_t resizeText[10];
-                swprintf_s(resizeText, L"%d", g_state.resizePercent);
-                DrawTextW(memDC, resizeText, -1, &rResizeInput,
+                wchar_t resizeTextX[10];
+                swprintf_s(resizeTextX, L"%d", g_state.resizeWidth);
+                DrawTextW(memDC, resizeTextX, -1, &rResizeInputX,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             }
 
-            // Percent symbol
-            RECT rPercent = { RESIZE_INPUT_X + RESIZE_INPUT_W + 5, RESIZE_INPUT_Y,
-                              RESIZE_INPUT_X + RESIZE_INPUT_W + 30, RESIZE_INPUT_Y + RESIZE_INPUT_H };
-            DrawTextW(memDC, L"%", -1, &rPercent, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            // "x" separator
+            SetTextColor(memDC, RGB(200, 220, 255));
+            RECT rX = { RESIZE_INPUT_X_X + RESIZE_INPUT_X_W + 2, RESIZE_INPUT_X_Y,
+                        RESIZE_INPUT_Y_X - 2, RESIZE_INPUT_X_Y + RESIZE_INPUT_H };
+            DrawTextW(memDC, L"x", -1, &rX, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            // Y Input (Height)
+            if (!g_state.resizeInputYActive) {
+                DrawRoundedRect(memDC, RESIZE_INPUT_Y_X, RESIZE_INPUT_Y_Y,
+                    RESIZE_INPUT_Y_W, RESIZE_INPUT_H, 4, RGB(40, 60, 100));
+
+                SetTextColor(memDC, RGB(255, 255, 255));
+                RECT rResizeInputY = { RESIZE_INPUT_Y_X + 5, RESIZE_INPUT_Y_Y,
+                                      RESIZE_INPUT_Y_X + RESIZE_INPUT_Y_W - 5, RESIZE_INPUT_Y_Y + RESIZE_INPUT_H };
+
+                wchar_t resizeTextY[10];
+                swprintf_s(resizeTextY, L"%d", g_state.resizeHeight);
+                DrawTextW(memDC, resizeTextY, -1, &rResizeInputY,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            }
         }
 
         // 2. Color Convert Checkbox
@@ -3028,7 +3616,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         SetTextColor(memDC, RGB(200, 220, 255));
         RECT rESRGANLabel = { CHK_ESRGAN_X + CHK_SIZE + 10, CHK_ESRGAN_Y,
                               CHK_ESRGAN_X + 250, CHK_ESRGAN_Y + CHK_SIZE };
-        DrawTextW(memDC, L"Real-ESRGAN Anime", -1, &rESRGANLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(memDC, L"Real-ESRGAN ai 2x 4x only (upscale)", -1, &rESRGANLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
 
         if (!g_state.doColorConvert) {
@@ -3599,7 +4187,7 @@ void PlayGodTierAnimeEnding(HDC hdc, HWND hWnd)
         startTime = 0;
         g_inAnimeMode = false;
         InvalidateRect(hWnd, nullptr, TRUE);
-        UpdateWindow(hWnd);         
+        UpdateWindow(hWnd);
     }
 
     BitBlt(hdc, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, memDC, 0, 0, SRCCOPY);
