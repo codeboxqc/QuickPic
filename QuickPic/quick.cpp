@@ -3881,10 +3881,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             swprintf_s(txt, L"%d%%", (int)(pct * 100 + 0.5f));
             DrawTextW(memDC, txt, -1, &rPct, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
+            // AI Working indicator if 0%
+            bool usingAI = (g_state.doUpscale || g_state.doRealESRGAN || g_state.doBgRemoval || g_state.doAutoWB || g_state.doSeamCarving);
+            if (pct == 0.0f && usingAI) {
+                SelectObject(memDC, hSmall);
+                SetTextColor(memDC, RGB(100, 200, 255));
+                int animDots = ((clock() - g_progressAnimTime) / 300) % 4;
+                std::wstring aiText = L"AI working";
+                for (int i = 0; i < animDots; ++i) aiText += L".";
+
+                RECT rAi = { barX, barY + barH + 12, barX + barW, barY + barH + 34 };
+                DrawTextW(memDC, aiText.c_str(), -1, &rAi, DT_LEFT | DT_SINGLELINE);
+            }
+
             // Current file
             SelectObject(memDC, hSmall);
             SetTextColor(memDC, RGB(255, 180, 120));
-            RECT rFile = { barX, barY + barH + 12, barX + barW, barY + barH + 34 };
+            // Shift current file text down if the AI text is drawn
+            int fileYOffset = (pct == 0.0f && usingAI) ? 28 : 12;
+            RECT rFile = { barX, barY + barH + fileYOffset, barX + barW, barY + barH + fileYOffset + 22 };
             std::wstring status;
             { std::lock_guard<std::mutex> l(g_statusMutex); status = g_conversionStatus; }
             if (status.length() > 38) status = status.substr(0, 35) + L"...";
@@ -3895,7 +3910,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             std::wstring fire = L"";
             for (int i = 0; i < dots; ++i) fire += (i & 1) ? L"●" : L"○";
             SetTextColor(memDC, RGB(255, 100, 50));
-            RECT rDots = { barX, barY + barH + 38, barX + barW, barY + barH + 62 };
+            int dotsYOffset = (pct == 0.0f && usingAI) ? 54 : 38;
+            RECT rDots = { barX, barY + barH + dotsYOffset, barX + barW, barY + barH + dotsYOffset + 24 };
             DrawTextW(memDC, fire.c_str(), -1, &rDots, DT_CENTER | DT_SINGLELINE);
         }
 
