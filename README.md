@@ -186,49 +186,167 @@ https://github.com/user-attachments/assets/f79fc295-9bdb-428f-a335-f2a1192a45ce
 #### Option B: Build OpenCV with CUDA (Advanced)
 
 ```cmd
-# Clone OpenCV
-git clone https://github.com/opencv/opencv.git
-git clone https://github.com/opencv/opencv_contrib.git
-cd opencv
-git checkout 4.13.0
-cd ../opencv_contrib
-git checkout 4.13.0
+:: Create the master directory
+mkdir E:\opencv
+cd /d E:\opencv
 
-# Create build directory
-cd ../opencv
+:: Clone the main OpenCV repository (Branch 4.x or specifically tag 4.13.0)
+git clone --branch 4.13.0 https://github.com/opencv/opencv.git opencv-src
+
+:: Clone the OpenCV Contrib repository (Must exactly match the main version)
+git clone --branch 4.13.0 https://github.com/opencv/opencv_contrib.git opencv_contrib
+
+:: Create the folder where the compiled binaries will go
 mkdir build
-cd build
 
-# Configure with CMake
+
+cd /d E:\opencv\build
+
+
+
+ cd /d E:\opencv\build
+del /q CMakeCache.txt
+rmdir /s /q CMakeFiles
+
+ 
+
 cmake -G "Visual Studio 17 2022" -A x64 ^
-  -DOPENCV_EXTRA_MODULES_PATH=../../opencv_contrib/modules ^
-  -DWITH_CUDA=ON ^
-  -DCUDA_FAST_MATH=ON ^
-  -DWITH_CUBLAS=ON ^
-  -DCUDA_ARCH_BIN="6.1;7.5;8.6;8.9" ^
-  -DWITH_OPENCL=ON ^
-  -DBUILD_opencv_world=ON ^
-  -DBUILD_EXAMPLES=OFF ^
-  -DBUILD_TESTS=OFF ^
-  ..
+-D CMAKE_VS_GLOBALS=VcpkgEnabled=false ^
+-D CMAKE_BUILD_TYPE=Release ^
+-D CMAKE_INSTALL_PREFIX=E:/opencv/install ^
+-D CMAKE_CXX_STANDARD=17 ^
+-D OPENCV_EXTRA_MODULES_PATH=E:/opencv/opencv_contrib/modules ^
+-D BUILD_opencv_world=ON ^
+-D WITH_CUDA=ON ^
+-D WITH_CUDNN=ON ^
+-D OPENCV_DNN_CUDA=ON ^
+-D CUDA_FAST_MATH=ON ^
+-D WITH_OPENVINO=ON ^
+-D OPENCV_DNN_OPENVINO=ON ^
+-D WITH_TBB=ON ^
+-D TBB_DIR=E:/opencv/tbb/lib/cmake/TBB ^
+-D WITH_EIGEN=ON ^
+-D EIGEN_INCLUDE_PATH=E:/opencv/eigen ^
+-D WITH_JPEG=ON ^
+-D WITH_PNG=ON ^
+-D WITH_TIFF=ON ^
+-D WITH_WEBP=ON ^
+-D WITH_OPENEXR=ON ^
+-D BUILD_ZLIB=ON ^
+-D BUILD_SHARED_LIBS=ON ^
+E:/opencv/opencv-src
 
-or
-
-cmake -S C:\src\opencv -B C:\build\opencv -G "Visual Studio 17 2022" -A x64 `
-  -DBUILD_SHARED_LIBS=ON `
-  -DWITH_CUDA=ON `
-  -DBUILD_opencv_world=ON `
-  -DOPENCV_EXTRA_MODULES_PATH=C:\src\opencv_contrib\modules `
-  -DBUILD_LIST=core,imgproc,imgcodecs,highgui,photo,cudaarithm,cudafilters,cudaimgproc,cudawarping,cudev `
-  -DCMAKE_INSTALL_PREFIX=C:\build\opencv\install
 
 
 
-# Build (takes 30-60 minutes)
+1. Install Eigen via Git
+Eigen is open-source, so we can clone it directly into the correct folder using Git.
+
+DOS
+cd /d E:\opencv
+
+:: Clone the stable 3.4.0 release directly into E:\opencv\eigen
+git clone --branch 3.4.0 https://gitlab.com/libeigen/eigen.git E:\opencv\eigen
+2. Install Intel TBB via cURL
+Because we want the pre-compiled Windows binaries for TBB (so you don't have to spend hours compiling TBB itself), we will use curl to download the zip file from GitHub, and tar to extract it.
+
+DOS
+cd /d E:\opencv
+
+:: Download the TBB release zip file
+curl -L -o tbb.zip https://github.com/uxlfoundation/oneTBB/releases/download/v2021.12.0/oneapi-tbb-2021.12.0-win.zip
+
+:: Extract the zip file
+tar -xf tbb.zip
+
+:: Rename the extracted folder to just "tbb" so CMake finds it easily
+rename oneapi-tbb-2021.12.0 tbb
+
+:: Clean up the zip file
+del tbb.zip
+3. What about OpenVINO?
+You can clone OpenVINO using Git (git clone --recurse-submodules https://github.com/openvinotoolkit/openvino.git), BUT compiling OpenVINO from source on Windows takes an incredibly long time and requires dozens of extra dependencies (Python, Ninja, etc.).
+
+For OpenVINO, it is highly recommended to download the pre-built Windows Archive. You can do that via the command line too:
+
+DOS
+cd /d E:\opencv
+
+:: Download the pre-built OpenVINO toolkit archive for Windows
+curl -L -o openvino.zip https://storage.openvinotoolkit.org/repositories/openvino/packages/2024.1/windows/w_openvino_toolkit_windows_2024.1.0.15008.f4afc983258_x86_64.zip
+
+:: Extract it
+tar -xf openvino.zip
+
+:: Rename it to "openvino" for simplicity
+rename w_openvino_toolkit_windows_2024.1.0.15008.f4afc983258_x86_64 openvino
+
+:: Clean up the zip
+del openvino.zip
+Verify Your Setup
+Once those commands finish, type dir in your command prompt. Your E:\opencv folder should now look exactly like this:
+
+Plaintext
+E:\opencv> dir
+...
+<DIR>  build
+<DIR>  eigen
+<DIR>  opencv-src
+<DIR>  opencv_contrib
+<DIR>  openvino
+<DIR>  tbb
+
+
+
+
+Phase 5: Compile Your Ultimate OpenCV Build
+Your configuration blueprint is ready. Run these two commands to compile and finalize your bare-metal installation:
+
+Compile the source files (This will utilize 8 CPU threads to expedite the process):
+
+DOS
 cmake --build . --config Release --parallel 8
+(This phase will take roughly 30 to 60 minutes as it builds all the custom AI and CUDA modules).
 
-# Install to C:\opencv
-cmake --install . --prefix C:/opencv
+Install and organize the binaries:
+
+DOS
+cmake --install . --config Release
+
+
+Step 1: Open the file instantly
+Open your command prompt and run this exact command. It will open the hidden file directly in Notepad:
+
+DOS
+notepad E:\opencv\opencv_contrib\modules\cudev\include\opencv2\cudev\ptr2d\zip.hpp
+Step 2: Change the two broken words
+In Notepad, scroll down to the very bottom of the file (around line 182).
+
+Look for this exact text:
+
+C++
+_LIBCUDACXX_BEGIN_NAMESPACE_STD
+Change it to:
+
+C++
+_CCCL_BEGIN_NAMESPACE_STD
+Then, look a few lines below that (around line 201) for this exact text:
+
+C++
+_LIBCUDACXX_END_NAMESPACE_STD
+Change it to:
+
+C++
+_CCCL_END_NAMESPACE_STD
+Step 3: Save and Resume!
+Save the file in Notepad (Ctrl + S) and close Notepad.
+
+Go straight back to your Visual Studio Command Prompt. You do not need to clear the cache or run CMake again.
+
+Just run the build command to resume exactly where it failed:
+
+DOS
+cmake --build . --config Release --parallel 8
 ```
 
 ---
